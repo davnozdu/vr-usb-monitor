@@ -38,8 +38,9 @@ class UsbMonitorService : Service() {
     @Volatile private var isBlocked   = false
 
     // Saved values to restore on disconnect
-    private var savedBacklight  = -1
-    private var savedTimeout    = -1
+    private var savedBacklight        = -1
+    private var savedSystemBrightness = -1
+    private var savedBrightnessMode   = -1
 
     private val handler = Handler(Looper.getMainLooper())
     private var pendingBlock: Runnable? = null
@@ -143,21 +144,29 @@ class UsbMonitorService : Service() {
         val screenOff  = prefs.getBoolean(Prefs.KEY_SCREEN_OFF,  true)
         val blockTouch = prefs.getBoolean(Prefs.KEY_BLOCK_TOUCH, true)
 
-        // Prevent system auto-sleep (mirrors: settings put system screen_off_timeout 2147483647)
-        savedTimeout = RootUtils.executeForOutput(
-            "settings get system screen_off_timeout"
-        ).toIntOrNull() ?: 30000
+        // Prevent system auto-sleep
         RootUtils.execute("settings put system screen_off_timeout $TIMEOUT_NEVER")
         log("Таймаут экрана → ∞")
 
         if (screenOff) {
+            // Save current brightness state
+            savedBrightnessMode = RootUtils.executeForOutput(
+                "settings get system screen_brightness_mode"
+            ).toIntOrNull() ?: 1
+
             if (backlightPath.isNotEmpty()) {
                 savedBacklight = RootUtils.readBacklightValue(backlightPath)
-                // Direct sysfs write keeps display signal alive for VR headset
+                savedSystemBrightness = RootUtils.executeForOutput(
+                    "settings get system screen_brightness"
+                ).toIntOrNull() ?: 128
+                // Disable auto-brightness and set to 0 via Android layer first,
+                // then write directly to sysfs — mirrors Macrodroid "VR On" sequence.
+                // This prevents the display manager from overriding the sysfs value.
+                RootUtils.execute("settings put system screen_brightness_mode 0")
+                RootUtils.execute("settings put system screen_brightness 0")
                 RootUtils.execute("echo 0 > $backlightPath")
-                log("Подсветка выключена ($backlightPath)")
+                log("Подсветка выключена")
             } else {
-                // Fallback via settings (less reliable, may not keep signal)
                 savedBacklight = RootUtils.executeForOutput(
                     "settings get system screen_brightness"
                 ).toIntOrNull() ?: 128
@@ -188,10 +197,10 @@ class UsbMonitorService : Service() {
 
     private fun reapplyBacklight() {
         if (!isBlocked) return
+        RootUtils.execute("settings put system screen_brightness_mode 0")
+        RootUtils.execute("settings put system screen_brightness 0")
         if (backlightPath.isNotEmpty()) {
             RootUtils.execute("echo 0 > $backlightPath")
-        } else {
-            RootUtils.execute("settings put system screen_brightness 0")
         }
     }
 
@@ -200,19 +209,22 @@ class UsbMonitorService : Service() {
         val screenOff  = prefs.getBoolean(Prefs.KEY_SCREEN_OFF,  true)
         val blockTouch = prefs.getBoolean(Prefs.KEY_BLOCK_TOUCH, true)
 
-        // Restore screen timeout
-        if (savedTimeout > 0) {
-            RootUtils.execute("settings put system screen_off_timeout $savedTimeout")
-            savedTimeout = -1
-            log("Таймаут экрана восстановлен")
-        }
+        // Set configured restore timeout (mirrors Macrodroid "VR Off")
+        val restoreSec = prefs.getInt(Prefs.KEY_RESTORE_TIMEOUT, Prefs.DEFAULT_RESTORE_TIMEOUT)
+        RootUtils.execute("settings put system screen_off_timeout ${restoreSec * 1000}")
+        log("Таймаут экрана → ${formatTime(restoreSec)}")
 
         if (screenOff && savedBacklight >= 0) {
             if (backlightPath.isNotEmpty()) {
                 RootUtils.execute("echo $savedBacklight > $backlightPath")
-            } else {
-                RootUtils.execute("settings put system screen_brightness $savedBacklight")
-                RootUtils.execute("settings put system screen_brightness_mode 1")
+            }
+            if (savedSystemBrightness >= 0) {
+                RootUtils.execute("settings put system screen_brightness $savedSystemBrightness")
+                savedSystemBrightness = -1
+            }
+            if (savedBrightnessMode >= 0) {
+                RootUtils.execute("settings put system screen_brightness_mode $savedBrightnessMode")
+                savedBrightnessMode = -1
             }
             savedBacklight = -1
             log("Подсветка восстановлена")

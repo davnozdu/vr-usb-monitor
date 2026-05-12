@@ -43,33 +43,20 @@ object RootUtils {
     }
 
     // Touchscreen via Linux input subsystem inhibit interface.
-    // On OnePlus 15: /sys/class/input/input7/inhibited
-    // Write "1" to block, "0" to unblock — no chmod needed.
+    // Uses grep to find the name file containing "touch" pattern,
+    // then constructs the inhibited path — avoids multi-line su -c issues.
     fun findTouchInhibit(): String {
-        // First pass: match by device name
-        val byName = """
-            for dir in /sys/class/input/input*; do
-                [ -f "${'$'}dir/inhibited" ] || continue
-                name=$(cat "${'$'}dir/name" 2>/dev/null | tr '[:upper:]' '[:lower:]')
-                echo "${'$'}name" | grep -qE "touch|panel|screen|ts$" || continue
-                echo "${'$'}dir/inhibited"
-                break
-            done
-        """.trimIndent()
-        val byNameResult = executeForOutput(byName)
-        if (byNameResult.startsWith("/sys/")) return byNameResult
-
-        // Fallback: any inhibited input that is not a key/button device
-        val fallback = """
-            for dir in /sys/class/input/input*; do
-                [ -f "${'$'}dir/inhibited" ] || continue
-                name=$(cat "${'$'}dir/name" 2>/dev/null | tr '[:upper:]' '[:lower:]')
-                echo "${'$'}name" | grep -qE "power|key|button|volume|gpio" && continue
-                echo "${'$'}dir/inhibited"
-                break
-            done
-        """.trimIndent()
-        return executeForOutput(fallback)
+        for (pattern in listOf("touchpanel", "touchscreen", "touch_panel", "touch")) {
+            val namePath = executeForOutput(
+                "grep -rl '$pattern' /sys/class/input/*/name 2>/dev/null | head -1"
+            ).trim()
+            if (namePath.startsWith("/sys/")) {
+                val inhibitedPath = namePath.removeSuffix("name") + "inhibited"
+                val exists = executeForOutput("test -f $inhibitedPath && echo ok").trim()
+                if (exists == "ok") return inhibitedPath
+            }
+        }
+        return ""
     }
 
     // Backlight sysfs brightness node.

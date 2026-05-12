@@ -39,6 +39,7 @@ class MainActivity : AppCompatActivity() {
 
         setupToggles()
         setupDelaySlider()
+        setupRestoreSlider()
         checkRoot()
         setStatus(State.IDLE)
     }
@@ -88,8 +89,10 @@ class MainActivity : AppCompatActivity() {
     private fun setupDelaySlider() {
         val prefs = Prefs.get(this)
         val saved = prefs.getInt(Prefs.KEY_DELAY_SECONDS, Prefs.DEFAULT_DELAY)
-        binding.delaySlider.value = saved.toFloat()
-        binding.delayValueText.text = formatDelay(saved)
+        // Clamp to new valid range [0, 120] in case old saved value > 120
+        val clamped = saved.coerceIn(0, 120).let { it - (it % 5) }
+        binding.delaySlider.value = clamped.toFloat()
+        binding.delayValueText.text = formatDelay(clamped)
         binding.delaySlider.addOnChangeListener { _, value, _ ->
             val sec = value.toInt()
             prefs.edit().putInt(Prefs.KEY_DELAY_SECONDS, sec).apply()
@@ -97,10 +100,25 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun setupRestoreSlider() {
+        val prefs = Prefs.get(this)
+        val saved = prefs.getInt(Prefs.KEY_RESTORE_TIMEOUT, Prefs.DEFAULT_RESTORE_TIMEOUT)
+        // Valid values: 15, 30, 45, 60
+        val clamped = (saved.coerceIn(15, 60) / 15) * 15
+        binding.restoreTimeoutSlider.value = clamped.toFloat()
+        binding.restoreTimeoutValueText.text = formatDelay(clamped)
+        binding.restoreTimeoutSlider.addOnChangeListener { _, value, _ ->
+            val sec = value.toInt()
+            prefs.edit().putInt(Prefs.KEY_RESTORE_TIMEOUT, sec).apply()
+            binding.restoreTimeoutValueText.text = formatDelay(sec)
+        }
+    }
+
     private fun setActionTogglesEnabled(enabled: Boolean) {
-        binding.switchScreenOff.isEnabled  = enabled
-        binding.switchBlockTouch.isEnabled = enabled
-        binding.delaySlider.isEnabled      = enabled
+        binding.switchScreenOff.isEnabled        = enabled
+        binding.switchBlockTouch.isEnabled       = enabled
+        binding.delaySlider.isEnabled            = enabled
+        binding.restoreTimeoutSlider.isEnabled   = enabled
     }
 
     private fun checkRoot() {
