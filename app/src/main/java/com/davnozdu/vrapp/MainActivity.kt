@@ -112,7 +112,8 @@ class MainActivity : AppCompatActivity() {
         Thread {
             val hasRoot = RootUtils.checkRoot()
             runOnUiThread {
-                binding.rootStatusText.text = if (hasRoot) "Root: доступен" else "Root: недоступен"
+                binding.rootStatusText.text = if (hasRoot) "Root: доступен"
+                    else "Root: недоступен — выдайте в KernelSU → SuperUser"
                 binding.rootStatusText.setTextColor(
                     getColor(if (hasRoot) R.color.green else R.color.red)
                 )
