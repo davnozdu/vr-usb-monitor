@@ -39,25 +39,32 @@ object RootUtils {
         return executeForOutput(script)
     }
 
-    // Returns list of gyroscope + accelerometer input devices.
-    // On some devices (CHRE/IIO sensor stack) this list may be empty —
-    // in that case sensor blocking via /dev/input is not supported.
     fun findMotionSensors(): List<String> {
         val script = """
             for dev in /dev/input/event*; do
                 info=$(getevent -pl "${'$'}dev" 2>&1)
-                # Gyroscope: has ABS_RX/RY/RZ
                 if echo "${'$'}info" | grep -qE "ABS_RX|ABS_RY|ABS_RZ"; then
                     echo "${'$'}dev"
                     continue
                 fi
-                # Accelerometer: has ABS_X/Y/Z but NOT multi-touch (not the touchscreen)
                 if echo "${'$'}info" | grep -q "ABS_X" && ! echo "${'$'}info" | grep -q "ABS_MT_POSITION_X"; then
                     echo "${'$'}dev"
                 fi
             done
         """.trimIndent()
         return executeForOutput(script).lines().filter { it.startsWith("/dev/input/") }
+    }
+
+    fun findPowerButton(): String {
+        val script = """
+            for dev in /dev/input/event*; do
+                if getevent -pl "${'$'}dev" 2>&1 | grep -q "KEY_POWER"; then
+                    echo "${'$'}dev"
+                    break
+                fi
+            done
+        """.trimIndent()
+        return executeForOutput(script)
     }
 
     fun chmodDevices(devices: List<String>, mode: String) {

@@ -18,19 +18,19 @@ class MainActivity : AppCompatActivity() {
     private val eventReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.action) {
-                UsbMonitorService.ACTION_USB_CONNECTED    -> setStatus(State.CONNECTED_WAITING)
+                UsbMonitorService.ACTION_USB_CONNECTED    -> setStatus(State.WAITING)
                 UsbMonitorService.ACTION_USB_DISCONNECTED -> setStatus(State.IDLE)
-                UsbMonitorService.ACTION_COUNTDOWN        -> {
+                UsbMonitorService.ACTION_EMERGENCY_RESTORED -> setStatus(State.UNBLOCKED)
+                UsbMonitorService.ACTION_COUNTDOWN -> {
                     val left = intent.getIntExtra(UsbMonitorService.EXTRA_SECONDS_LEFT, 0)
-                    if (left == 0) setStatus(State.BLOCKED)
-                    else setStatus(State.CONNECTED_WAITING, left)
+                    if (left == 0) setStatus(State.BLOCKED) else setStatus(State.WAITING, left)
                 }
                 UsbMonitorService.ACTION_LOG -> appendLog(intent.getStringExtra("message") ?: "")
             }
         }
     }
 
-    private enum class State { IDLE, CONNECTED_WAITING, BLOCKED }
+    private enum class State { IDLE, WAITING, BLOCKED, UNBLOCKED }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -49,6 +49,7 @@ class MainActivity : AppCompatActivity() {
             addAction(UsbMonitorService.ACTION_USB_CONNECTED)
             addAction(UsbMonitorService.ACTION_USB_DISCONNECTED)
             addAction(UsbMonitorService.ACTION_COUNTDOWN)
+            addAction(UsbMonitorService.ACTION_EMERGENCY_RESTORED)
             addAction(UsbMonitorService.ACTION_LOG)
         }
         LocalBroadcastManager.getInstance(this).registerReceiver(eventReceiver, filter)
@@ -91,10 +92,8 @@ class MainActivity : AppCompatActivity() {
     private fun setupDelaySlider() {
         val prefs = Prefs.get(this)
         val saved = prefs.getInt(Prefs.KEY_DELAY_SECONDS, Prefs.DEFAULT_DELAY)
-
         binding.delaySlider.value = saved.toFloat()
         binding.delayValueText.text = formatDelay(saved)
-
         binding.delaySlider.addOnChangeListener { _, value, _ ->
             val sec = value.toInt()
             prefs.edit().putInt(Prefs.KEY_DELAY_SECONDS, sec).apply()
@@ -128,7 +127,7 @@ class MainActivity : AppCompatActivity() {
                 binding.statusText.text    = "USB устройство не подключено"
                 binding.statusSubtext.text = "Ожидание подключения..."
             }
-            State.CONNECTED_WAITING -> {
+            State.WAITING -> {
                 binding.statusDot.setBackgroundResource(R.drawable.circle_waiting)
                 binding.statusText.text    = "USB подключено"
                 binding.statusSubtext.text =
@@ -138,7 +137,12 @@ class MainActivity : AppCompatActivity() {
             State.BLOCKED -> {
                 binding.statusDot.setBackgroundResource(R.drawable.circle_connected)
                 binding.statusText.text    = "Активно — экран отключён"
-                binding.statusSubtext.text = "Тач и подсветка заблокированы"
+                binding.statusSubtext.text = "2× кнопка питания = аварийный сброс"
+            }
+            State.UNBLOCKED -> {
+                binding.statusDot.setBackgroundResource(R.drawable.circle_waiting)
+                binding.statusText.text    = "Разблокировано вручную"
+                binding.statusSubtext.text = "USB всё ещё подключён"
             }
         }
     }

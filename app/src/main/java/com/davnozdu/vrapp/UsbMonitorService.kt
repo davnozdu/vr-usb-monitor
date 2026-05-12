@@ -9,22 +9,30 @@ import androidx.localbroadcastmanager.content.LocalBroadcastManager
 class UsbMonitorService : Service() {
 
     companion object {
-        const val ACTION_USB_CONNECTED    = "com.davnozdu.vrapp.USB_CONNECTED"
-        const val ACTION_USB_DISCONNECTED = "com.davnozdu.vrapp.USB_DISCONNECTED"
-        const val ACTION_COUNTDOWN        = "com.davnozdu.vrapp.COUNTDOWN"
-        const val ACTION_LOG              = "com.davnozdu.vrapp.LOG"
-        const val EXTRA_USB_ACTION        = "usb_action"
-        const val EXTRA_SECONDS_LEFT      = "seconds_left"
+        const val ACTION_USB_CONNECTED       = "com.davnozdu.vrapp.USB_CONNECTED"
+        const val ACTION_USB_DISCONNECTED    = "com.davnozdu.vrapp.USB_DISCONNECTED"
+        const val ACTION_COUNTDOWN           = "com.davnozdu.vrapp.COUNTDOWN"
+        const val ACTION_LOG                 = "com.davnozdu.vrapp.LOG"
+        const val ACTION_EMERGENCY_RESTORED  = "com.davnozdu.vrapp.EMERGENCY_RESTORED"
+        const val EXTRA_USB_ACTION           = "usb_action"
+        const val EXTRA_SECONDS_LEFT         = "seconds_left"
+        const val EXTRA_SERVICE_ACTION       = "service_action"
+        const val SERVICE_ACTION_EMERGENCY   = "emergency_reset"
 
-        private const val CHANNEL_ID      = "vrapp_channel"
-        private const val NOTIFICATION_ID = 1
+        private const val CHANNEL_ID         = "vrapp_channel"
+        private const val NOTIFICATION_ID    = 1
+
+        // Double-press window: two KEY_POWER DOWN events within this range (ms)
+        private const val DOUBLE_PRESS_MIN   = 80L
+        private const val DOUBLE_PRESS_MAX   = 600L
     }
 
-    private var touchscreenDevice: String = ""
+    private var touchscreenDevice: String   = ""
     private var sensorDevices: List<String> = emptyList()
+    private var powerButtonDevice: String   = ""
 
-    private var isConnected = false
-    private var isBlocked   = false
+    @Volatile private var isConnected = false
+    @Volatile private var isBlocked   = false
 
     private var savedBrightness     = -1
     private var savedBrightnessMode = -1
@@ -32,17 +40,22 @@ class UsbMonitorService : Service() {
     private val handler = Handler(Looper.getMainLooper())
     private var pendingBlock: Runnable? = null
     private var countdownTimer: CountDownTimer? = null
+    private var powerMonitorProcess: Process? = null
+
+    // ── Lifecycle ───────────────────────────────────────────────────────────
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
-        startForeground(NOTIFICATION_ID, buildNotification("Мониторинг активен"))
+        startForeground(NOTIFICATION_ID, buildNotification("Мониторинг активен", showReset = false))
         Thread {
             touchscreenDevice = RootUtils.findTouchscreen()
-            sensorDevices = RootUtils.findMotionSensors()
+            sensorDevices     = RootUtils.findMotionSensors()
+            powerButtonDevice = RootUtils.findPowerButton()
             log("Сервис запущен")
             log("Тачскрин: ${touchscreenDevice.ifEmpty { "не найден" }}")
             log("Датчики: ${if (sensorDevices.isEmpty()) "не найдены (HAL/CHRE)" else sensorDevices.joinToString()}")
+            log("Кнопка питания: ${powerButtonDevice.ifEmpty { "не найдена" }}")
         }.start()
     }
 
@@ -51,18 +64,22 @@ class UsbMonitorService : Service() {
             "android.hardware.usb.action.USB_DEVICE_ATTACHED" -> onUsbAttached()
             "android.hardware.usb.action.USB_DEVICE_DETACHED" -> onUsbDetached()
         }
+        if (intent?.getStringExtra(EXTRA_SERVICE_ACTION) == SERVICE_ACTION_EMERGENCY) {
+            Thread { emergencyRestore() }.start()
+        }
         return START_STICKY
     }
 
     override fun onDestroy() {
         super.onDestroy()
         cancelPending()
+        stopPowerMonitor()
         if (isConnected || isBlocked) onUsbDetached()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    // ── USB events ─────────────────────────────────────────────────────────
+    // ── USB events ──────────────────────────────────────────────────────────
 
     private fun onUsbAttached() {
         if (isConnected) return
@@ -79,13 +96,13 @@ class UsbMonitorService : Service() {
 
         log("USB подключено — блокировка через ${formatTime(delaySec)}")
         startCountdown(delaySec)
-
         pendingBlock = Runnable { Thread { applyBlocking() }.start() }
         handler.postDelayed(pendingBlock!!, delaySec * 1000L)
     }
 
     private fun onUsbDetached() {
         cancelPending()
+        stopPowerMonitor()
         isConnected = false
 
         log("USB отключено")
@@ -95,7 +112,7 @@ class UsbMonitorService : Service() {
             isBlocked = false
         }
 
-        updateNotification("Мониторинг активен")
+        updateNotification("Мониторинг активен", showReset = false)
         broadcast(ACTION_USB_DISCONNECTED)
     }
 
@@ -108,9 +125,8 @@ class UsbMonitorService : Service() {
         val blockSensors = prefs.getBoolean(Prefs.KEY_BLOCK_SENSORS, false)
 
         if (screenOff) {
-            // Save current brightness and mode, then set backlight to 0.
-            // Using brightness=0 keeps the display signal alive for the VR headset
-            // while the phone screen goes dark (unlike KEYCODE_SLEEP which cuts the signal).
+            // brightness=0 turns off the backlight while keeping the display signal alive —
+            // the VR headset continues to receive video, unlike KEYCODE_SLEEP which cuts it.
             savedBrightnessMode = RootUtils.executeForOutput(
                 "settings get system screen_brightness_mode"
             ).toIntOrNull() ?: 1
@@ -120,14 +136,12 @@ class UsbMonitorService : Service() {
 
             RootUtils.execute("settings put system screen_brightness_mode 0")
             RootUtils.execute("settings put system screen_brightness 0")
-            log("Подсветка выключена (яркость → 0, дисплей продолжает работать)")
+            log("Подсветка выключена (дисплей продолжает работать в очках)")
         }
-
         if (blockTouch && touchscreenDevice.isNotEmpty()) {
             RootUtils.execute("chmod 000 $touchscreenDevice")
             log("Тач заблокирован")
         }
-
         if (blockSensors) {
             if (sensorDevices.isNotEmpty()) {
                 RootUtils.chmodDevices(sensorDevices, "000")
@@ -138,7 +152,14 @@ class UsbMonitorService : Service() {
         }
 
         isBlocked = true
-        updateNotification("VR гарнитура подключена — экран отключён")
+        updateNotification("VR гарнитура — экран отключён", showReset = true)
+
+        if (powerButtonDevice.isNotEmpty()) {
+            log("Аварийный сброс: двойное нажатие кнопки питания")
+            startPowerButtonMonitor()
+        } else {
+            log("Аварийный сброс: кнопка в уведомлении")
+        }
     }
 
     private fun restoreAll() {
@@ -161,6 +182,53 @@ class UsbMonitorService : Service() {
             RootUtils.chmodDevices(sensorDevices, "664")
             log("Датчики движения восстановлены")
         }
+    }
+
+    // ── Emergency restore ───────────────────────────────────────────────────
+
+    private fun emergencyRestore() {
+        if (!isBlocked) return
+        log("Аварийный сброс — все блокировки сняты")
+        restoreAll()
+        isBlocked = false
+        stopPowerMonitor()
+        // USB may still be connected — service keeps running but unblocked
+        updateNotification("Разблокировано вручную (USB подключён)", showReset = false)
+        broadcast(ACTION_EMERGENCY_RESTORED)
+    }
+
+    // ── Power button monitor ────────────────────────────────────────────────
+
+    private fun startPowerButtonMonitor() {
+        stopPowerMonitor()
+        Thread {
+            try {
+                val process = Runtime.getRuntime()
+                    .exec(arrayOf("su", "-c", "getevent -l $powerButtonDevice"))
+                powerMonitorProcess = process
+                val reader = process.inputStream.bufferedReader()
+                var lastPressMs = 0L
+                var line: String?
+                while (reader.readLine().also { line = it } != null && isBlocked) {
+                    val l = line ?: continue
+                    if (l.contains("KEY_POWER") && l.contains("DOWN")) {
+                        val now = System.currentTimeMillis()
+                        val gap = now - lastPressMs
+                        if (gap in DOUBLE_PRESS_MIN..DOUBLE_PRESS_MAX) {
+                            // Double press detected
+                            emergencyRestore()
+                            break
+                        }
+                        lastPressMs = now
+                    }
+                }
+            } catch (_: Exception) {}
+        }.apply { isDaemon = true; start() }
+    }
+
+    private fun stopPowerMonitor() {
+        powerMonitorProcess?.destroy()
+        powerMonitorProcess = null
     }
 
     // ── Countdown ───────────────────────────────────────────────────────────
@@ -191,18 +259,26 @@ class UsbMonitorService : Service() {
     }
 
     private fun log(msg: String) {
-        LocalBroadcastManager.getInstance(this)
-            .sendBroadcast(Intent(ACTION_LOG).putExtra("message", msg))
+        handler.post {
+            LocalBroadcastManager.getInstance(this)
+                .sendBroadcast(Intent(ACTION_LOG).putExtra("message", msg))
+        }
     }
 
     private fun broadcast(action: String) {
-        LocalBroadcastManager.getInstance(this).sendBroadcast(Intent(action))
+        handler.post {
+            LocalBroadcastManager.getInstance(this).sendBroadcast(Intent(action))
+        }
     }
 
     private fun broadcastCountdown(secondsLeft: Int) {
-        LocalBroadcastManager.getInstance(this)
-            .sendBroadcast(Intent(ACTION_COUNTDOWN).putExtra(EXTRA_SECONDS_LEFT, secondsLeft))
+        handler.post {
+            LocalBroadcastManager.getInstance(this)
+                .sendBroadcast(Intent(ACTION_COUNTDOWN).putExtra(EXTRA_SECONDS_LEFT, secondsLeft))
+        }
     }
+
+    // ── Notification ────────────────────────────────────────────────────────
 
     private fun createNotificationChannel() {
         val channel = NotificationChannel(
@@ -211,22 +287,35 @@ class UsbMonitorService : Service() {
         getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
     }
 
-    private fun buildNotification(text: String): Notification {
-        val pi = PendingIntent.getActivity(
+    private fun buildNotification(text: String, showReset: Boolean): Notification {
+        val openIntent = PendingIntent.getActivity(
             this, 0,
             Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE
         )
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("VR Monitor")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_menu_manage)
-            .setContentIntent(pi)
-            .build()
+            .setContentIntent(openIntent)
+
+        if (showReset) {
+            val resetIntent = PendingIntent.getService(
+                this, 1,
+                Intent(this, UsbMonitorService::class.java)
+                    .putExtra(EXTRA_SERVICE_ACTION, SERVICE_ACTION_EMERGENCY),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            )
+            builder.addAction(android.R.drawable.ic_menu_close_clear_cancel, "Аварийный сброс", resetIntent)
+        }
+
+        return builder.build()
     }
 
-    private fun updateNotification(text: String) {
-        getSystemService(NotificationManager::class.java)
-            .notify(NOTIFICATION_ID, buildNotification(text))
+    private fun updateNotification(text: String, showReset: Boolean) {
+        handler.post {
+            getSystemService(NotificationManager::class.java)
+                .notify(NOTIFICATION_ID, buildNotification(text, showReset))
+        }
     }
 }
