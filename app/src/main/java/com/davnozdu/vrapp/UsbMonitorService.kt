@@ -40,7 +40,7 @@ class UsbMonitorService : Service() {
     private val handler = Handler(Looper.getMainLooper())
     private var pendingBlock: Runnable? = null
     private var countdownTimer: CountDownTimer? = null
-    private var powerMonitorProcess: Process? = null
+    private var powerMonitorProcess: java.lang.Process? = null
 
     // ── Lifecycle ───────────────────────────────────────────────────────────
 
