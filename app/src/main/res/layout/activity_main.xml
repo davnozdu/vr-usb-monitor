@@ -179,7 +179,7 @@
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
                         android:layout_marginTop="2dp"
-                        android:text="chmod 000 /dev/input/eventX"
+                        android:text="/sys/class/input/inputX/inhibited = 1"
                         android:textSize="11sp"
                         android:textColor="?attr/colorOnSurfaceVariant" />
                 </LinearLayout>
@@ -189,44 +189,6 @@
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:checked="true" />
-            </LinearLayout>
-
-            <!-- Block sensors -->
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:orientation="horizontal"
-                android:gravity="center_vertical"
-                android:paddingHorizontal="12dp"
-                android:paddingVertical="10dp">
-
-                <LinearLayout
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:orientation="vertical">
-
-                    <TextView
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:text="Блокировать датчики движения"
-                        android:textSize="14sp"
-                        android:textColor="?attr/colorOnSurface" />
-
-                    <TextView
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:layout_marginTop="2dp"
-                        android:text="Гироскоп, акселерометр (если доступны в /dev/input)"
-                        android:textSize="11sp"
-                        android:textColor="?attr/colorOnSurfaceVariant" />
-                </LinearLayout>
-
-                <com.google.android.material.switchmaterial.SwitchMaterial
-                    android:id="@+id/switchBlockSensors"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:checked="false" />
             </LinearLayout>
 
             <View
@@ -277,6 +239,19 @@
                     android:stepSize="30"
                     android:value="120" />
             </LinearLayout>
+
+            <!-- Emergency restore tip -->
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:paddingHorizontal="12dp"
+                android:paddingTop="2dp"
+                android:paddingBottom="12dp"
+                android:text="Аварийный сброс (когда экран заблокирован): 2× кнопка питания"
+                android:textSize="11sp"
+                android:textColor="?attr/colorOnSurfaceVariant"
+                android:drawablePadding="6dp"
+                android:drawableStart="@android:drawable/ic_dialog_info" />
 
         </LinearLayout>
     </com.google.android.material.card.MaterialCardView>

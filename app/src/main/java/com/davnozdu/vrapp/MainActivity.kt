@@ -71,18 +71,14 @@ class MainActivity : AppCompatActivity() {
             else stopService(Intent(this, UsbMonitorService::class.java))
         }
 
-        binding.switchScreenOff.isChecked    = prefs.getBoolean(Prefs.KEY_SCREEN_OFF,    true)
-        binding.switchBlockTouch.isChecked   = prefs.getBoolean(Prefs.KEY_BLOCK_TOUCH,   true)
-        binding.switchBlockSensors.isChecked = prefs.getBoolean(Prefs.KEY_BLOCK_SENSORS, false)
+        binding.switchScreenOff.isChecked  = prefs.getBoolean(Prefs.KEY_SCREEN_OFF,  true)
+        binding.switchBlockTouch.isChecked = prefs.getBoolean(Prefs.KEY_BLOCK_TOUCH, true)
 
         binding.switchScreenOff.setOnCheckedChangeListener { _, v ->
             prefs.edit().putBoolean(Prefs.KEY_SCREEN_OFF, v).apply()
         }
         binding.switchBlockTouch.setOnCheckedChangeListener { _, v ->
             prefs.edit().putBoolean(Prefs.KEY_BLOCK_TOUCH, v).apply()
-        }
-        binding.switchBlockSensors.setOnCheckedChangeListener { _, v ->
-            prefs.edit().putBoolean(Prefs.KEY_BLOCK_SENSORS, v).apply()
         }
 
         setActionTogglesEnabled(prefs.getBoolean(Prefs.KEY_ENABLED, true))
@@ -102,10 +98,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setActionTogglesEnabled(enabled: Boolean) {
-        binding.switchScreenOff.isEnabled    = enabled
-        binding.switchBlockTouch.isEnabled   = enabled
-        binding.switchBlockSensors.isEnabled = enabled
-        binding.delaySlider.isEnabled        = enabled
+        binding.switchScreenOff.isEnabled  = enabled
+        binding.switchBlockTouch.isEnabled = enabled
+        binding.delaySlider.isEnabled      = enabled
     }
 
     private fun checkRoot() {

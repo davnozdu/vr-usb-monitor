@@ -22,6 +22,8 @@ object RootUtils {
 
     fun checkRoot(): Boolean = resolveSu().isNotEmpty()
 
+    fun getSuPath(): String = resolveSu()
+
     fun execute(command: String): Boolean {
         val su = resolveSu().ifEmpty { return false }
         return try {

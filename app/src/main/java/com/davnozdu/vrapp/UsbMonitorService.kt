@@ -242,9 +242,9 @@ class UsbMonitorService : Service() {
         stopPowerMonitor()
         Thread {
             try {
+                val su = RootUtils.getSuPath().ifEmpty { "su" }
                 val process = Runtime.getRuntime()
-                    .exec(arrayOf(RootUtils.executeForOutput("which su").ifEmpty { "su" }, "-c",
-                        "getevent -l $powerButtonDevice"))
+                    .exec(arrayOf(su, "-c", "getevent -l $powerButtonDevice"))
                 powerMonitorProcess = process
                 val reader = process.inputStream.bufferedReader()
                 var lastPressMs = 0L
