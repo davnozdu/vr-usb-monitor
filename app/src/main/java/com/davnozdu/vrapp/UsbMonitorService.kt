@@ -273,9 +273,8 @@ class UsbMonitorService : Service() {
     private fun startCountdown(totalSeconds: Int) {
         countdownTimer?.cancel()
         countdownTimer = object : CountDownTimer(totalSeconds * 1000L, 1000L) {
-            override fun onTick(millis: Long) =
-                broadcastCountdown(((millis + 999) / 1000).toInt())
-            override fun onFinish() = broadcastCountdown(0)
+            override fun onTick(millis: Long) { broadcastCountdown(((millis + 999) / 1000).toInt()) }
+            override fun onFinish() { broadcastCountdown(0) }
         }.start()
     }
 
