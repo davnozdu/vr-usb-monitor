@@ -165,12 +165,17 @@ class UsbMonitorService : Service() {
                 savedSystemBrightness = RootUtils.executeForOutput(
                     "settings get system screen_brightness"
                 ).toIntOrNull() ?: 128
-                // Disable auto-brightness and zero via Android layer first,
-                // then write sysfs — mirrors Macrodroid "VR On" sequence.
+                // Step 1: zero via Android settings layer (disables auto-brightness)
                 RootUtils.execute("settings put system screen_brightness_mode 0")
                 RootUtils.execute("settings put system screen_brightness 0")
                 RootUtils.execute("echo 0 > $backlightPath")
-                log("Подсветка выключена")
+                log("Подсветка → 0, повтор через 5с...")
+                // Step 2: repeat after 5 s — overrides any display-manager restore
+                Thread.sleep(5_000L)
+                if (isConnected) {
+                    RootUtils.execute("echo 0 > $backlightPath")
+                    log("Подсветка выключена")
+                }
             } else {
                 savedBacklight = RootUtils.executeForOutput(
                     "settings get system screen_brightness"
@@ -222,12 +227,11 @@ class UsbMonitorService : Service() {
                 RootUtils.execute("settings put system screen_brightness $savedSystemBrightness")
                 savedSystemBrightness = -1
             }
-            if (savedBrightnessMode >= 0) {
-                RootUtils.execute("settings put system screen_brightness_mode $savedBrightnessMode")
-                savedBrightnessMode = -1
-            }
+            // Always restore to Auto brightness mode
+            RootUtils.execute("settings put system screen_brightness_mode 1")
+            savedBrightnessMode = -1
             savedBacklight = -1
-            log("Подсветка восстановлена")
+            log("Подсветка восстановлена (авто)")
         }
 
         if (blockTouch && touchInhibitPath.isNotEmpty()) {

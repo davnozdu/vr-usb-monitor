@@ -72,14 +72,4 @@ object RootUtils {
         return executeForOutput("cat $maxPath").toIntOrNull() ?: 255
     }
 
-    fun findPowerButton(): String {
-        val script = """
-            for dev in /dev/input/event*; do
-                getevent -pl "${'$'}dev" 2>&1 | grep -q "KEY_POWER" || continue
-                echo "${'$'}dev"
-                break
-            done
-        """.trimIndent()
-        return executeForOutput(script)
-    }
 }
