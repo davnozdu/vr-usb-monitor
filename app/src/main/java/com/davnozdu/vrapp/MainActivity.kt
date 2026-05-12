@@ -151,7 +151,7 @@ class MainActivity : AppCompatActivity() {
             State.BLOCKED -> {
                 binding.statusDot.setBackgroundResource(R.drawable.circle_connected)
                 binding.statusText.text    = "Активно — экран отключён"
-                binding.statusSubtext.text = "2× кнопка питания = аварийный сброс"
+                binding.statusSubtext.text = "Уведомление → Аварийный сброс"
             }
             State.UNBLOCKED -> {
                 binding.statusDot.setBackgroundResource(R.drawable.circle_waiting)

@@ -19,19 +19,16 @@ class UsbMonitorService : Service() {
         const val EXTRA_SERVICE_ACTION      = "service_action"
         const val SERVICE_ACTION_EMERGENCY  = "emergency_reset"
 
-        private const val CHANNEL_ID        = "vrapp_channel"
-        private const val NOTIFICATION_ID   = 1
-        private const val DOUBLE_PRESS_MIN  = 80L
-        private const val DOUBLE_PRESS_MAX  = 600L
+        private const val CHANNEL_ID      = "vrapp_channel"
+        private const val NOTIFICATION_ID = 1
 
         // "Never sleep" value used by Macrodroid
-        private const val TIMEOUT_NEVER     = "2147483647"
+        private const val TIMEOUT_NEVER   = "2147483647"
     }
 
-    // Discovered hardware paths
-    private var touchInhibitPath: String    = ""
-    private var backlightPath: String       = ""
-    private var powerButtonDevice: String   = ""
+    // Discovered hardware paths (may be empty if root wasn't ready at startup)
+    private var touchInhibitPath: String = ""
+    private var backlightPath: String    = ""
 
     // State
     @Volatile private var isConnected = false
@@ -45,7 +42,6 @@ class UsbMonitorService : Service() {
     private val handler = Handler(Looper.getMainLooper())
     private var pendingBlock: Runnable? = null
     private var countdownTimer: CountDownTimer? = null
-    private var powerMonitorProcess: java.lang.Process? = null
 
     // Re-darkens screen if it comes on while VR is active (mirrors Macrodroid "VR On 2")
     private val screenOnReceiver = object : BroadcastReceiver() {
@@ -83,7 +79,6 @@ class UsbMonitorService : Service() {
         super.onDestroy()
         unregisterReceiver(screenOnReceiver)
         cancelPending()
-        stopPowerMonitor()
         if (isConnected || isBlocked) onUsbDetached()
     }
 
@@ -92,16 +87,26 @@ class UsbMonitorService : Service() {
     // ── Hardware discovery ───────────────────────────────────────────────────
 
     private fun discoverHardware() {
-        touchInhibitPath  = RootUtils.findTouchInhibit()
-        backlightPath     = RootUtils.findBacklightPath()
-        powerButtonDevice = RootUtils.findPowerButton()
+        touchInhibitPath = RootUtils.findTouchInhibit()
+        backlightPath    = RootUtils.findBacklightPath()
 
         log("Сервис запущен")
         log("Тачскрин: ${touchInhibitPath.ifEmpty { "не найден (нет root?)" }}")
         log("Подсветка: ${backlightPath.ifEmpty { "не найден (нет root?)" }}")
-        log("Кнопка питания: ${powerButtonDevice.ifEmpty { "не найдена" }}")
         if (touchInhibitPath.isEmpty() || backlightPath.isEmpty()) {
             log("⚠ Выдайте root приложению в KernelSU Manager → SuperUser")
+        }
+    }
+
+    // Retry discovery at block time in case root wasn't ready at startup
+    private fun ensurePathsDiscovered() {
+        if (touchInhibitPath.isEmpty()) {
+            touchInhibitPath = RootUtils.findTouchInhibit()
+            if (touchInhibitPath.isNotEmpty()) log("Тачскрин найден: $touchInhibitPath")
+        }
+        if (backlightPath.isEmpty()) {
+            backlightPath = RootUtils.findBacklightPath()
+            if (backlightPath.isNotEmpty()) log("Подсветка найдена: $backlightPath")
         }
     }
 
@@ -126,7 +131,6 @@ class UsbMonitorService : Service() {
 
     private fun onUsbDetached() {
         cancelPending()
-        stopPowerMonitor()
         isConnected = false
         log("USB отключено")
         if (isBlocked) {
@@ -140,6 +144,9 @@ class UsbMonitorService : Service() {
     // ── Blocking ─────────────────────────────────────────────────────────────
 
     private fun applyBlocking() {
+        // Retry path discovery in case root wasn't ready when service started
+        ensurePathsDiscovered()
+
         val prefs      = Prefs.get(this)
         val screenOff  = prefs.getBoolean(Prefs.KEY_SCREEN_OFF,  true)
         val blockTouch = prefs.getBoolean(Prefs.KEY_BLOCK_TOUCH, true)
@@ -149,7 +156,6 @@ class UsbMonitorService : Service() {
         log("Таймаут экрана → ∞")
 
         if (screenOff) {
-            // Save current brightness state
             savedBrightnessMode = RootUtils.executeForOutput(
                 "settings get system screen_brightness_mode"
             ).toIntOrNull() ?: 1
@@ -159,9 +165,8 @@ class UsbMonitorService : Service() {
                 savedSystemBrightness = RootUtils.executeForOutput(
                     "settings get system screen_brightness"
                 ).toIntOrNull() ?: 128
-                // Disable auto-brightness and set to 0 via Android layer first,
-                // then write directly to sysfs — mirrors Macrodroid "VR On" sequence.
-                // This prevents the display manager from overriding the sysfs value.
+                // Disable auto-brightness and zero via Android layer first,
+                // then write sysfs — mirrors Macrodroid "VR On" sequence.
                 RootUtils.execute("settings put system screen_brightness_mode 0")
                 RootUtils.execute("settings put system screen_brightness 0")
                 RootUtils.execute("echo 0 > $backlightPath")
@@ -187,12 +192,7 @@ class UsbMonitorService : Service() {
 
         isBlocked = true
         updateNotification("VR — экран отключён", true)
-        if (powerButtonDevice.isNotEmpty()) {
-            log("Аварийный сброс: двойное нажатие кнопки питания")
-            startPowerButtonMonitor()
-        } else {
-            log("Аварийный сброс: кнопка в уведомлении")
-        }
+        log("Аварийный сброс: кнопка в уведомлении или отключите USB")
     }
 
     private fun reapplyBacklight() {
@@ -243,41 +243,8 @@ class UsbMonitorService : Service() {
         log("Аварийный сброс")
         restoreAll()
         isBlocked = false
-        stopPowerMonitor()
         updateNotification("Разблокировано вручную (USB подключён)", false)
         broadcast(ACTION_EMERGENCY_RESTORED)
-    }
-
-    // ── Power button monitor ──────────────────────────────────────────────────
-
-    private fun startPowerButtonMonitor() {
-        stopPowerMonitor()
-        Thread {
-            try {
-                val su = RootUtils.getSuPath().ifEmpty { "su" }
-                val process = Runtime.getRuntime()
-                    .exec(arrayOf(su, "-c", "getevent -l $powerButtonDevice"))
-                powerMonitorProcess = process
-                val reader = process.inputStream.bufferedReader()
-                var lastPressMs = 0L
-                var line: String?
-                while (reader.readLine().also { line = it } != null && isBlocked) {
-                    val l = line ?: continue
-                    if (l.contains("KEY_POWER") && l.contains("DOWN")) {
-                        val now = System.currentTimeMillis()
-                        if (now - lastPressMs in DOUBLE_PRESS_MIN..DOUBLE_PRESS_MAX) {
-                            emergencyRestore(); break
-                        }
-                        lastPressMs = now
-                    }
-                }
-            } catch (_: Exception) {}
-        }.apply { isDaemon = true; start() }
-    }
-
-    private fun stopPowerMonitor() {
-        powerMonitorProcess?.destroy()
-        powerMonitorProcess = null
     }
 
     // ── Countdown ────────────────────────────────────────────────────────────
