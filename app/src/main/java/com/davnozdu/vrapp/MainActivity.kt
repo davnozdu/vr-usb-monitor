@@ -30,7 +30,7 @@ class MainActivity : AppCompatActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        setupSwitch()
+        setupToggles()
         checkRoot()
         setStatus(connected = false)
     }
@@ -50,17 +50,41 @@ class MainActivity : AppCompatActivity() {
         LocalBroadcastManager.getInstance(this).unregisterReceiver(eventReceiver)
     }
 
-    private fun setupSwitch() {
-        val prefs = getSharedPreferences("vrapp", MODE_PRIVATE)
-        val enabled = prefs.getBoolean("enabled", true)
-        binding.monitoringSwitch.isChecked = enabled
+    private fun setupToggles() {
+        val prefs = Prefs.get(this)
 
-        if (enabled) startService()
-
-        binding.monitoringSwitch.setOnCheckedChangeListener { _, checked ->
-            prefs.edit().putBoolean("enabled", checked).apply()
-            if (checked) startService() else stopService(Intent(this, UsbMonitorService::class.java))
+        // Master switch
+        binding.switchEnabled.isChecked = prefs.getBoolean(Prefs.KEY_ENABLED, true)
+        binding.switchEnabled.setOnCheckedChangeListener { _, checked ->
+            prefs.edit().putBoolean(Prefs.KEY_ENABLED, checked).apply()
+            updateActionTogglesEnabled(checked)
+            if (checked) startMonitoring() else stopService(Intent(this, UsbMonitorService::class.java))
         }
+
+        // Action toggles
+        binding.switchScreenOff.isChecked   = prefs.getBoolean(Prefs.KEY_SCREEN_OFF,    true)
+        binding.switchBlockTouch.isChecked  = prefs.getBoolean(Prefs.KEY_BLOCK_TOUCH,   true)
+        binding.switchBlockSensors.isChecked= prefs.getBoolean(Prefs.KEY_BLOCK_SENSORS, false)
+
+        binding.switchScreenOff.setOnCheckedChangeListener { _, v ->
+            prefs.edit().putBoolean(Prefs.KEY_SCREEN_OFF, v).apply()
+        }
+        binding.switchBlockTouch.setOnCheckedChangeListener { _, v ->
+            prefs.edit().putBoolean(Prefs.KEY_BLOCK_TOUCH, v).apply()
+        }
+        binding.switchBlockSensors.setOnCheckedChangeListener { _, v ->
+            prefs.edit().putBoolean(Prefs.KEY_BLOCK_SENSORS, v).apply()
+        }
+
+        updateActionTogglesEnabled(prefs.getBoolean(Prefs.KEY_ENABLED, true))
+
+        if (prefs.getBoolean(Prefs.KEY_ENABLED, true)) startMonitoring()
+    }
+
+    private fun updateActionTogglesEnabled(enabled: Boolean) {
+        binding.switchScreenOff.isEnabled    = enabled
+        binding.switchBlockTouch.isEnabled   = enabled
+        binding.switchBlockSensors.isEnabled = enabled
     }
 
     private fun checkRoot() {
@@ -81,11 +105,11 @@ class MainActivity : AppCompatActivity() {
     private fun setStatus(connected: Boolean) {
         if (connected) {
             binding.statusDot.setBackgroundResource(R.drawable.circle_connected)
-            binding.statusText.text = "USB устройство подключено"
-            binding.statusSubtext.text = "Экран выключен, тач заблокирован"
+            binding.statusText.text    = "USB устройство подключено"
+            binding.statusSubtext.text = "Активные блокировки применены"
         } else {
             binding.statusDot.setBackgroundResource(R.drawable.circle_disconnected)
-            binding.statusText.text = "USB устройство не подключено"
+            binding.statusText.text    = "USB устройство не подключено"
             binding.statusSubtext.text = "Ожидание подключения..."
         }
     }
@@ -98,7 +122,7 @@ class MainActivity : AppCompatActivity() {
         binding.logScrollView.post { binding.logScrollView.scrollTo(0, 0) }
     }
 
-    private fun startService() {
+    private fun startMonitoring() {
         ContextCompat.startForegroundService(this, Intent(this, UsbMonitorService::class.java))
     }
 }

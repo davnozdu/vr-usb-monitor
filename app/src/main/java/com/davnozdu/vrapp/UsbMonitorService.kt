@@ -18,15 +18,22 @@ class UsbMonitorService : Service() {
         private const val NOTIFICATION_ID = 1
     }
 
-    private var touchscreenDevice: String? = null
+    private var touchscreenDevice: String = ""
+    private var sensorDevices: List<String> = emptyList()
     private var isConnected = false
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification("Мониторинг активен"))
-        touchscreenDevice = RootUtils.findTouchscreen()
-        log("Сервис запущен. Тачскрин: ${touchscreenDevice?.ifEmpty { "не найден" } ?: "не найден"}")
+
+        Thread {
+            touchscreenDevice = RootUtils.findTouchscreen()
+            sensorDevices = RootUtils.findMotionSensors()
+            log("Сервис запущен")
+            log("Тачскрин: ${touchscreenDevice.ifEmpty { "не найден" }}")
+            log("Датчики движения: ${if (sensorDevices.isEmpty()) "не найдены (HAL/CHRE)" else sensorDevices.joinToString()}")
+        }.start()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -47,12 +54,28 @@ class UsbMonitorService : Service() {
     private fun onUsbAttached() {
         if (isConnected) return
         isConnected = true
-        log("USB подключено — блокирую тач и выключаю экран")
 
-        touchscreenDevice?.takeIf { it.isNotEmpty() }?.let { dev ->
-            RootUtils.execute("chmod 000 $dev")
+        val prefs = Prefs.get(this)
+        val blockTouch   = prefs.getBoolean(Prefs.KEY_BLOCK_TOUCH,   true)
+        val blockSensors = prefs.getBoolean(Prefs.KEY_BLOCK_SENSORS, false)
+        val screenOff    = prefs.getBoolean(Prefs.KEY_SCREEN_OFF,    true)
+
+        log("USB подключено")
+
+        if (blockTouch && touchscreenDevice.isNotEmpty()) {
+            RootUtils.execute("chmod 000 $touchscreenDevice")
+            log("Тач заблокирован")
         }
-        RootUtils.execute("input keyevent 223")
+        if (blockSensors && sensorDevices.isNotEmpty()) {
+            RootUtils.chmodDevices(sensorDevices, "000")
+            log("Датчики движения заблокированы (${sensorDevices.size} устр.)")
+        } else if (blockSensors && sensorDevices.isEmpty()) {
+            log("Датчики: блокировка через /dev/input недоступна на этом устройстве")
+        }
+        if (screenOff) {
+            RootUtils.execute("input keyevent 223")
+            log("Экран выключен")
+        }
 
         updateNotification("VR гарнитура подключена")
         broadcast(ACTION_USB_CONNECTED)
@@ -61,11 +84,25 @@ class UsbMonitorService : Service() {
     private fun onUsbDetached() {
         if (!isConnected) return
         isConnected = false
-        log("USB отключено — восстанавливаю тач и включаю экран")
 
-        RootUtils.execute("input keyevent 224")
-        touchscreenDevice?.takeIf { it.isNotEmpty() }?.let { dev ->
-            RootUtils.execute("chmod 664 $dev")
+        val prefs = Prefs.get(this)
+        val blockTouch   = prefs.getBoolean(Prefs.KEY_BLOCK_TOUCH,   true)
+        val blockSensors = prefs.getBoolean(Prefs.KEY_BLOCK_SENSORS, false)
+        val screenOff    = prefs.getBoolean(Prefs.KEY_SCREEN_OFF,    true)
+
+        log("USB отключено")
+
+        if (screenOff) {
+            RootUtils.execute("input keyevent 224")
+            log("Экран включён")
+        }
+        if (blockTouch && touchscreenDevice.isNotEmpty()) {
+            RootUtils.execute("chmod 664 $touchscreenDevice")
+            log("Тач восстановлен")
+        }
+        if (blockSensors && sensorDevices.isNotEmpty()) {
+            RootUtils.chmodDevices(sensorDevices, "664")
+            log("Датчики движения восстановлены")
         }
 
         updateNotification("Мониторинг активен")
