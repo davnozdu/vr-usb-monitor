@@ -112,7 +112,7 @@
             <View
                 android:layout_width="match_parent"
                 android:layout_height="1dp"
-                android:marginHorizontal="12dp"
+                android:layout_marginHorizontal="12dp"
                 android:background="?attr/colorOutlineVariant" />
 
             <!-- Screen off -->
