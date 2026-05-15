@@ -3,6 +3,7 @@ package com.davnozdu.vrapp
 import android.app.*
 import android.content.*
 import android.os.*
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 
@@ -42,6 +43,7 @@ class UsbMonitorService : Service() {
     private val handler = Handler(Looper.getMainLooper())
     private var pendingBlock: Runnable? = null
     private var countdownTimer: CountDownTimer? = null
+    private var wakeLock: PowerManager.WakeLock? = null
 
     // Re-darkens screen if it comes on while VR is active (mirrors Macrodroid "VR On 2")
     private val screenOnReceiver = object : BroadcastReceiver() {
@@ -80,6 +82,7 @@ class UsbMonitorService : Service() {
         unregisterReceiver(screenOnReceiver)
         cancelPending()
         if (isConnected || isBlocked) onUsbDetached()
+        releaseWakeLock()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -137,6 +140,7 @@ class UsbMonitorService : Service() {
             restoreAll()
             isBlocked = false
         }
+        releaseWakeLock()
         updateNotification("Мониторинг активен", false)
         broadcast(ACTION_USB_DISCONNECTED)
     }
@@ -196,6 +200,7 @@ class UsbMonitorService : Service() {
         }
 
         isBlocked = true
+        acquireWakeLock()
         updateNotification("VR — экран отключён", true)
         log("Аварийный сброс: кнопка в уведомлении или отключите USB")
     }
@@ -247,6 +252,7 @@ class UsbMonitorService : Service() {
         log("Аварийный сброс")
         restoreAll()
         isBlocked = false
+        releaseWakeLock()
         updateNotification("Разблокировано вручную (USB подключён)", false)
         broadcast(ACTION_EMERGENCY_RESTORED)
     }
@@ -285,9 +291,18 @@ class UsbMonitorService : Service() {
     }
 
     private fun createNotificationChannel() {
-        getSystemService(NotificationManager::class.java).createNotificationChannel(
-            NotificationChannel(CHANNEL_ID, "VR Monitor", NotificationManager.IMPORTANCE_LOW)
-        )
+        // IMPORTANCE_MIN — канал не показывает иконку в статус-баре,
+        // уведомление видно только при раскрытии шторки. Foreground-сервис
+        // защищён, процесс живёт дольше.
+        val channel = NotificationChannel(
+            CHANNEL_ID, "VR Monitor", NotificationManager.IMPORTANCE_MIN
+        ).apply {
+            setShowBadge(false)
+            setSound(null, null)
+            enableVibration(false)
+            enableLights(false)
+        }
+        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
     }
 
     private fun buildNotification(text: String, showReset: Boolean): Notification {
@@ -297,6 +312,10 @@ class UsbMonitorService : Service() {
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("VR Monitor").setContentText(text)
             .setSmallIcon(android.R.drawable.ic_menu_manage).setContentIntent(open)
+            .setPriority(NotificationCompat.PRIORITY_MIN)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
+            .setSilent(true)
+            .setShowWhen(false)
         if (showReset) {
             val reset = PendingIntent.getService(
                 this, 1,
@@ -307,6 +326,20 @@ class UsbMonitorService : Service() {
             builder.addAction(android.R.drawable.ic_menu_close_clear_cancel, "Аварийный сброс", reset)
         }
         return builder.build()
+    }
+
+    private fun acquireWakeLock() {
+        if (wakeLock?.isHeld == true) return
+        val pm = getSystemService(POWER_SERVICE) as PowerManager
+        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "vrapp:block").apply {
+            setReferenceCounted(false)
+            acquire()
+        }
+    }
+
+    private fun releaseWakeLock() {
+        wakeLock?.takeIf { it.isHeld }?.release()
+        wakeLock = null
     }
 
     private fun updateNotification(text: String, showReset: Boolean) = handler.post {

@@ -1,7 +1,13 @@
 package com.davnozdu.vrapp
 
 import android.content.*
+import android.net.Uri
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
+import android.view.LayoutInflater
+import android.widget.CheckBox
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
@@ -42,6 +48,49 @@ class MainActivity : AppCompatActivity() {
         setupRestoreSlider()
         checkRoot()
         setStatus(State.IDLE)
+        maybeShowInputTip()
+        maybeRequestBatteryOptimization()
+    }
+
+    private fun maybeShowInputTip() {
+        val prefs = Prefs.get(this)
+        if (prefs.getBoolean(Prefs.KEY_HIDE_INPUT_TIP, false)) return
+
+        val view = LayoutInflater.from(this).inflate(R.layout.dialog_input_tip, null)
+        val checkbox = view.findViewById<CheckBox>(R.id.dontShowAgain)
+
+        AlertDialog.Builder(this)
+            .setTitle("Памятка")
+            .setView(view)
+            .setPositiveButton("Понятно") { dialog, _ ->
+                if (checkbox.isChecked) {
+                    prefs.edit().putBoolean(Prefs.KEY_HIDE_INPUT_TIP, true).apply()
+                }
+                dialog.dismiss()
+            }
+            .setCancelable(false)
+            .show()
+    }
+
+    private fun maybeRequestBatteryOptimization() {
+        val prefs = Prefs.get(this)
+        if (prefs.getBoolean(Prefs.KEY_BATTERY_OPT_ASKED, false)) return
+
+        val pm = getSystemService(POWER_SERVICE) as PowerManager
+        if (pm.isIgnoringBatteryOptimizations(packageName)) {
+            prefs.edit().putBoolean(Prefs.KEY_BATTERY_OPT_ASKED, true).apply()
+            return
+        }
+
+        try {
+            @Suppress("BatteryLife")
+            val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                .setData(Uri.parse("package:$packageName"))
+            startActivity(intent)
+        } catch (_: Exception) {
+            startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+        }
+        prefs.edit().putBoolean(Prefs.KEY_BATTERY_OPT_ASKED, true).apply()
     }
 
     override fun onResume() {
