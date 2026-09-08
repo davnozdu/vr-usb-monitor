@@ -73,7 +73,6 @@ class UsbMonitorService : Service() {
     private var blockJob: Job? = null
 
     private val prefs: SharedPreferences by lazy { Prefs.get(this) }
-    private val usbManager: UsbManager by lazy { getSystemService(USB_SERVICE) as UsbManager }
     private val displayManager: DisplayManager by lazy {
         getSystemService(DISPLAY_SERVICE) as DisplayManager
     }
@@ -86,8 +85,8 @@ class UsbMonitorService : Service() {
      * — точный признак.
      */
     private val displayListener = object : DisplayManager.DisplayListener {
-        override fun onDisplayAdded(displayId: Int) = onDisplayEvent("дисплей подключён")
-        override fun onDisplayRemoved(displayId: Int) = onDisplayEvent("дисплей отключён")
+        override fun onDisplayAdded(displayId: Int) = onDisplayEvent("внешний дисплей подключён")
+        override fun onDisplayRemoved(displayId: Int) = onDisplayEvent("внешний дисплей отключён")
         override fun onDisplayChanged(displayId: Int) = Unit
     }
 
@@ -209,18 +208,14 @@ class UsbMonitorService : Service() {
         }
     }
 
-    // ── USB ──────────────────────────────────────────────────────────────────
+    // ── Внешний дисплей ──────────────────────────────────────────────────────
 
     /**
-     * Решение принимается по фактическому составу шины, а не по факту события.
-     * Гарнитура — композитное устройство (HID + audio + hub), она поднимает
-     * несколько ATTACHED и роняет несколько DETACHED; по одному лишь событию
-     * блокировка снималась бы, пока очки ещё на голове.
+     * Единственный признак, по которому включается блокировка: есть ли
+     * включённый внешний дисплей. USB намеренно не участвует — воткнутая
+     * флешка, клавиатура или хаб не должны гасить экран, а вынутая флешка
+     * не должна снимать блокировку, пока очки на голове.
      */
-    private fun usbDevicesPresent(): Boolean =
-        try { usbManager.deviceList.isNotEmpty() } catch (_: Exception) { false }
-
-    /** Есть ли включённый внешний дисплей — то есть видит ли пользователь картинку в очках. */
     private fun externalDisplayPresent(): Boolean = try {
         displayManager.displays.any { it.displayId != Display.DEFAULT_DISPLAY && it.isValid }
     } catch (_: Exception) {
@@ -230,30 +225,26 @@ class UsbMonitorService : Service() {
     private fun onDisplayEvent(reason: String) {
         scope.launch {
             delay(SETTLE_DELAY_MS)
-            val present = externalDisplayPresent()
-            if (present && !isConnected) {
-                log(reason)
-                handleAttach()
-            } else if (!present && isConnected) {
-                log(reason)
-                handleDetach()
-            }
+            evaluate(reason)
         }
     }
 
     /**
-     * USB-событие само по себе решения не принимает: оно лишь будит сервис,
-     * а блокировка включается по внешнему дисплею. Отключение USB при этом
-     * снимает блокировку сразу — ждать пропажи дисплея незачем.
+     * USB-броадкаст решения не принимает: он лишь будит сервис, если система
+     * его выгрузила, после чего состояние всё равно пересчитывается по дисплею.
      */
     private fun onUsbEvent() {
         scope.launch {
             delay(SETTLE_DELAY_MS)
-            if (!usbDevicesPresent() && isConnected) {
-                handleDetach()
-            } else if (externalDisplayPresent() && !isConnected) {
-                handleAttach()
-            }
+            evaluate("проверка после USB-события")
+        }
+    }
+
+    private suspend fun evaluate(reason: String) {
+        val present = externalDisplayPresent()
+        when {
+            present && !isConnected -> { log(reason); handleAttach() }
+            !present && isConnected -> { log(reason); handleDetach() }
         }
     }
 
@@ -267,9 +258,9 @@ class UsbMonitorService : Service() {
         blockJob?.cancel()
         blockJob = scope.launch {
             if (delaySec == 0) {
-                log("USB подключено — блокирую немедленно")
+                log("Блокирую экран")
             } else {
-                log("USB подключено — блокировка через ${formatTime(delaySec)}")
+                log("Блокировка через ${formatTime(delaySec)}")
                 for (left in delaySec downTo 1) {
                     VrState.setPhase(VrState.Phase.WAITING, left)
                     delay(1_000L)
@@ -292,8 +283,7 @@ class UsbMonitorService : Service() {
         blockJob?.cancel()
         blockJob = null
         isConnected = false
-        log("USB отключено")
-        if (isBlocked) hwMutex.withLock { restore("USB отключено") }
+        if (isBlocked) hwMutex.withLock { restore("внешний дисплей отключён") }
         VrState.setPhase(VrState.Phase.IDLE)
         updateNotification("Мониторинг активен", false)
     }
@@ -342,7 +332,7 @@ class UsbMonitorService : Service() {
 
         VrState.setPhase(VrState.Phase.BLOCKED)
         updateNotification("VR — экран отключён", true)
-        log("Выход: отключите USB, 4 нажатия питания или кнопка в уведомлении")
+        log("Выход: отключите очки, 4 нажатия питания или кнопка в уведомлении")
     }
 
     private fun reapplyBacklight() {
