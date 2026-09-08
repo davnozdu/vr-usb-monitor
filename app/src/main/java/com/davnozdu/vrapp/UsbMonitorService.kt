@@ -362,6 +362,16 @@ class UsbMonitorService : Service() {
     private suspend fun recoverAfterRestart() {
         if (!prefs.getBoolean(Prefs.KEY_APPLIED, false)) return
 
+        // Снимок мог пережить откат, сделанный root-сторожем: он снимает
+        // блокировку, но до prefs приложения не дотягивается. Верить снимку
+        // можно только если железо и правда всё ещё заблокировано.
+        if (!hardwareStillBlocked()) {
+            log("Снимок блокировки устарел — железо уже разблокировано")
+            clearAppliedSnapshot()
+            VrState.setPhase(VrState.Phase.IDLE)
+            return
+        }
+
         if (usbDevicesPresent()) {
             // Гарнитура на месте — не зажигаем экран человеку посреди просмотра,
             // а просто подхватываем состояние обратно.
@@ -378,6 +388,21 @@ class UsbMonitorService : Service() {
             hwMutex.withLock { restore("перезапуск сервиса") }
             VrState.setPhase(VrState.Phase.IDLE)
         }
+    }
+
+    /** Читает sysfs и говорит, действительно ли блокировка из снимка ещё в силе. */
+    private fun hardwareStillBlocked(): Boolean {
+        val touchPath = prefs.getString(Prefs.KEY_APPLIED_TOUCH_PATH, "").orEmpty()
+        val blPath    = prefs.getString(Prefs.KEY_APPLIED_BL_PATH, "").orEmpty()
+
+        if (prefs.getBoolean(Prefs.KEY_APPLIED_BLOCK_TOUCH, false) && touchPath.isNotEmpty()) {
+            return RootShell.out("cat \"$touchPath\"") == "1"
+        }
+        if (prefs.getBoolean(Prefs.KEY_APPLIED_SCREEN_OFF, false) && blPath.isNotEmpty()) {
+            return RootShell.out("cat \"$blPath\"") == "0"
+        }
+        // Нечего проверить (нет root или обе опции выключены) — считаем снимок валидным.
+        return true
     }
 
     // ── Снимок применённого состояния ────────────────────────────────────────
