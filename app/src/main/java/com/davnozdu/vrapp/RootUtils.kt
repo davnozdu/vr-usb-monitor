@@ -10,7 +10,7 @@ object RootUtils {
 
     /**
      * Тачскрин через inhibit-интерфейс input-подсистемы ядра.
-     * Ищем в /sys/class/input/*/name устройство с "touch" в имени и проверяем,
+     * Ищем в /sys/class/input/<N>/name устройство с "touch" в имени и проверяем,
      * что рядом лежит узел inhibited (на OnePlus 15 это input7 / "touchpanel").
      */
     fun findTouchInhibit(): String {
