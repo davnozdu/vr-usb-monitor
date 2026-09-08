@@ -12,7 +12,6 @@ import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.hardware.usb.UsbManager
 import android.os.IBinder
-import android.os.PowerManager
 import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
@@ -47,17 +46,14 @@ class UsbMonitorService : Service() {
         /** USB-события приходят чуть раньше, чем обновляется список устройств. */
         private const val SETTLE_DELAY_MS = 400L
 
-        private const val HEARTBEAT_INTERVAL_MS = 5_000L
-
-        /** Через сколько секунд молчания приложения root-сторож снимает блокировку. */
-        private const val WATCHDOG_GRACE_SEC = 30
-
         /** Аварийный выход: столько событий вкл/выкл экрана за окно = паника. */
         private const val PANIC_EVENTS    = 4
         private const val PANIC_WINDOW_MS = 3_000L
 
         private const val WATCHDOG_SCRIPT = "vr_watchdog.sh"
-        private const val HEARTBEAT_FILE  = "vr_heartbeat"
+
+        /** Наличие этого файла означает штатную остановку: сторож выходит молча. */
+        private const val WATCHDOG_STOP_FILE = "vr_watchdog_stop"
     }
 
     private val job   = SupervisorJob()
@@ -73,8 +69,6 @@ class UsbMonitorService : Service() {
     @Volatile private var isBlocked   = false
 
     private var blockJob: Job? = null
-    private var heartbeatJob: Job? = null
-    private var wakeLock: PowerManager.WakeLock? = null
 
     private val prefs: SharedPreferences by lazy { Prefs.get(this) }
     private val usbManager: UsbManager by lazy { getSystemService(USB_SERVICE) as UsbManager }
@@ -161,8 +155,6 @@ class UsbMonitorService : Service() {
             t.start()
             t.join(5_000L)
         }
-        stopHeartbeat()
-        releaseWakeLock()
         scope.cancel()
         RootShell.close()
     }
@@ -274,8 +266,6 @@ class UsbMonitorService : Service() {
         // что откатывать и к каким значениям.
         saveAppliedSnapshot(screenOff, blockTouch, savedBacklight)
         isBlocked = true
-        acquireWakeLock()
-        startHeartbeat()
         startWatchdog(savedBacklight)
 
         RootShell.exec("settings put system screen_off_timeout $TIMEOUT_NEVER")
@@ -354,8 +344,6 @@ class UsbMonitorService : Service() {
 
         clearAppliedSnapshot()
         stopWatchdog()
-        stopHeartbeat()
-        releaseWakeLock()
         isBlocked = false
         log("Восстановлено: $reason")
     }
@@ -381,8 +369,6 @@ class UsbMonitorService : Service() {
             isBlocked   = true
             touchInhibitPath = prefs.getString(Prefs.KEY_APPLIED_TOUCH_PATH, "").orEmpty()
             backlightPath    = prefs.getString(Prefs.KEY_APPLIED_BL_PATH, "").orEmpty()
-            acquireWakeLock()
-            startHeartbeat()
             startWatchdog(prefs.getInt(Prefs.KEY_APPLIED_BL_VALUE, -1))
             VrState.setPhase(VrState.Phase.BLOCKED)
             updateNotification("VR — экран отключён", true)
@@ -413,53 +399,41 @@ class UsbMonitorService : Service() {
 
     // ── Root-сторож ("мёртвая рука") ─────────────────────────────────────────
 
-    private fun heartbeatFile() = File(filesDir, HEARTBEAT_FILE)
+    private fun stopFile() = File(filesDir, WATCHDOG_STOP_FILE)
 
     /**
-     * Пока приложение живо, оно раз в 5 секунд обновляет файл-пульс. Если
-     * пульс пропал дольше чем на [WATCHDOG_GRACE_SEC], root-скрипт снимает
-     * блокировку сам — иначе убитое OOM-киллером приложение оставило бы
-     * телефон с чёрным экраном и мёртвым тачем без всякого выхода.
+     * Сторож живёт в root-шелле и следит за /proc/<pid> приложения. Если процесс
+     * исчезнет (OOM-киллер, краш), он сам вернёт яркость и снимет блокировку —
+     * иначе телефон остался бы с чёрным экраном и мёртвым тачем без выхода.
+     *
+     * Слежение идёт именно за процессом, а не за файлом-пульсом от приложения:
+     * пульс останавливался, как только устройство уходило в Doze (там система
+     * перестаёт уважать PARTIAL_WAKE_LOCK), и сторож снимал блокировку с живым
+     * приложением. Наличие /proc/<pid> от таймеров приложения не зависит вовсе.
      */
     private fun startWatchdog(savedBacklight: Int) {
         val script = File(filesDir, WATCHDOG_SCRIPT)
         script.writeText(WATCHDOG_SH)
-        heartbeatFile().writeText(System.currentTimeMillis().toString())
+        stopFile().delete()
 
         val restoreSec = prefs.getInt(Prefs.KEY_RESTORE_TIMEOUT, Prefs.DEFAULT_RESTORE_TIMEOUT)
             .coerceIn(15, 60)
 
         val args = listOf(
-            heartbeatFile().absolutePath,
+            android.os.Process.myPid().toString(),
+            stopFile().absolutePath,
             touchInhibitPath,
             backlightPath,
             savedBacklight.toString(),
             (restoreSec * 1000).toString(),
-            WATCHDOG_GRACE_SEC.toString(),
         ).joinToString(" ") { "\"$it\"" }
 
         RootShell.exec("nohup sh \"${script.absolutePath}\" $args >/dev/null 2>&1 &")
     }
 
-    /** Останавливаем сторож маркером, а не удалением файла: исчезнувший пульс он трактует как аварию. */
+    /** Штатная остановка: сторож увидит файл и выйдет, ничего не восстанавливая. */
     private fun stopWatchdog() {
-        try { heartbeatFile().writeText("stop") } catch (_: Exception) {}
-    }
-
-    private fun startHeartbeat() {
-        heartbeatJob?.cancel()
-        heartbeatJob = scope.launch {
-            while (isActive) {
-                try { heartbeatFile().writeText(System.currentTimeMillis().toString()) }
-                catch (_: Exception) {}
-                delay(HEARTBEAT_INTERVAL_MS)
-            }
-        }
-    }
-
-    private fun stopHeartbeat() {
-        heartbeatJob?.cancel()
-        heartbeatJob = null
+        try { stopFile().writeText("stop") } catch (_: Exception) {}
     }
 
     // ── Прочее ───────────────────────────────────────────────────────────────
@@ -519,47 +493,29 @@ class UsbMonitorService : Service() {
         }
     }
 
-    /**
-     * Держит CPU, чтобы пульс для root-сторожа не пропускался в Doze.
-     * Экран это не удерживает — за него отвечает screen_off_timeout = ∞.
-     */
-    private fun acquireWakeLock() {
-        if (wakeLock?.isHeld == true) return
-        val pm = getSystemService(POWER_SERVICE) as PowerManager
-        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "vrapp:heartbeat").apply {
-            setReferenceCounted(false)
-            acquire(12 * 60 * 60 * 1000L)
-        }
-    }
-
-    private fun releaseWakeLock() {
-        try { wakeLock?.takeIf { it.isHeld }?.release() } catch (_: Exception) {}
-        wakeLock = null
-    }
 }
 
 /**
  * Сторож живёт в root-шелле и переживает смерть приложения.
- * Аргументы: пульс, узел inhibited, узел brightness, сохранённая яркость,
- * таймаут экрана в мс, допустимая пауза пульса в секундах.
+ * Аргументы: pid приложения, файл штатной остановки, узел inhibited,
+ * узел brightness, сохранённая яркость, таймаут экрана в мс.
  */
 private val WATCHDOG_SH = """
 #!/system/bin/sh
-HB="${'$'}1"; TOUCH="${'$'}2"; BL="${'$'}3"; BLVAL="${'$'}4"; TIMEOUT="${'$'}5"; GRACE="${'$'}6"
+PID="${'$'}1"; STOP="${'$'}2"; TOUCH="${'$'}3"; BL="${'$'}4"; BLVAL="${'$'}5"; TIMEOUT="${'$'}6"
 
-while [ -f "${'$'}HB" ]; do
-  if [ "${'$'}(cat "${'$'}HB" 2>/dev/null)" = "stop" ]; then
-    exit 0
-  fi
-  NOW=${'$'}(date +%s)
-  MT=${'$'}(stat -c %Y "${'$'}HB" 2>/dev/null || echo 0)
-  if [ ${'$'}((NOW - MT)) -gt "${'$'}GRACE" ]; then
-    break
-  fi
-  sleep 3
+while [ -d "/proc/${'$'}PID" ]; do
+  # Приложение сняло блокировку само — уходим, ничего не трогая.
+  [ -f "${'$'}STOP" ] && exit 0
+  # Тот ли это процесс: pid мог быть переиспользован после смерти приложения.
+  grep -q vrapp "/proc/${'$'}PID/cmdline" 2>/dev/null || break
+  sleep 2
 done
 
-# Пульс пропал — приложение умерло, снимаем блокировку сами.
+# Ещё одна проверка на случай гонки: приложение успело завершиться штатно.
+[ -f "${'$'}STOP" ] && exit 0
+
+# Процесс приложения исчез — снимаем блокировку сами.
 [ -n "${'$'}TOUCH" ] && echo 0 > "${'$'}TOUCH" 2>/dev/null
 if [ -n "${'$'}BL" ] && [ "${'$'}BLVAL" -ge 0 ] 2>/dev/null; then
   echo "${'$'}BLVAL" > "${'$'}BL" 2>/dev/null
