@@ -58,10 +58,20 @@ jobs:
           TAG="${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}"
           cp app/build/outputs/apk/release/app-release.apk "vr-monitor-${TAG}.apk"
 
+      - name: Pick release notes
+        id: notes
+        run: |
+          TAG="${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}"
+          FILE=".github/RELEASE_NOTES_${TAG}.md"
+          if [ -f "$FILE" ]; then
+            echo "file=$FILE" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           name: VR Monitor ${{ github.event.inputs.tag || github.ref_name }}
-          generate_release_notes: true
+          body_path: ${{ steps.notes.outputs.file }}
+          generate_release_notes: ${{ steps.notes.outputs.file == '' }}
           files: vr-monitor-*.apk
