@@ -1,5 +1,6 @@
 package com.davnozdu.vrapp
 
+import android.util.Log
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -40,6 +41,7 @@ object VrState {
     }
 
     fun log(message: String) {
+        Log.i("VRapp", message)
         _log.tryEmit(message)
     }
 }

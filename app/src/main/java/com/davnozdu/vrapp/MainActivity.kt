@@ -23,6 +23,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import com.davnozdu.vrapp.databinding.ActivityMainBinding
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -54,6 +55,16 @@ class MainActivity : AppCompatActivity() {
         ensureNotificationPermission()
         maybeShowInputTip()
         maybeRequestBatteryOptimization()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Root мог быть выдан уже после первого запуска — результат проверки
+        // кэшируется, поэтому при каждом возврате в приложение спрашиваем заново.
+        lifecycleScope.launch(Dispatchers.IO) {
+            RootShell.forgetAvailability()
+            VrState.setRootAvailable(RootUtils.checkRoot())
+        }
     }
 
     /** targetSdk 35+ рисует контент под системными панелями — возвращаем отступы руками. */

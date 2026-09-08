@@ -1,5 +1,6 @@
 package com.davnozdu.vrapp
 
+import android.util.Log
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
@@ -25,6 +26,8 @@ object RootShell {
     }
 
     private val FAILED = Result(-1, "")
+
+    private const val TAG = "VRappRoot"
 
     private const val MARKER = "__VRAPP_DONE__"
     private const val DEFAULT_TIMEOUT_MS = 10_000L
@@ -122,9 +125,11 @@ object RootShell {
         for (su in SU_CANDIDATES) {
             val p = try {
                 ProcessBuilder(su).start()
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                Log.w(TAG, "spawn '$su' failed: ${e.javaClass.simpleName}: ${e.message}")
                 continue
             }
+            Log.i(TAG, "spawned '$su', waiting for handshake")
 
             // stderr вычитывается и выбрасывается — иначе полный pipe остановит шелл
             Thread {
@@ -153,11 +158,14 @@ object RootShell {
             }
 
             if (handshake) {
+                Log.i(TAG, "root shell ready via '$su'")
                 available = true
                 return p
             }
+            Log.w(TAG, "handshake failed for '$su' (alive=${p.isAlive})")
             closeLocked()
         }
+        Log.w(TAG, "no usable su found among $SU_CANDIDATES")
         available = false
         return null
     }
