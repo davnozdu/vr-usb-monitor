@@ -147,6 +147,9 @@ class UsbMonitorService : Service() {
             VrState.setRootAvailable(hasRoot)
             discoverHardware()
             recoverAfterRestart()
+            // Сервис мог стартовать при уже подключённых очках: события
+            // onDisplayAdded тогда не будет, дисплей появился раньше нас.
+            if (!isBlocked) evaluate("очки уже подключены")
         }
     }
 
