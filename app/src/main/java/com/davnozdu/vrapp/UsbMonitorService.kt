@@ -128,6 +128,14 @@ class UsbMonitorService : Service() {
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification("Мониторинг активен", false))
 
+        // Сервис могут поднять снаружи — ресивером, модулем или системой после
+        // START_STICKY. Выключенный пользователем мониторинг должен оставаться
+        // выключенным независимо от того, кто именно нас запустил.
+        if (!Prefs.get(this).getBoolean(Prefs.KEY_ENABLED, true)) {
+            stopSelf()
+            return
+        }
+
         ContextCompat.registerReceiver(
             this,
             screenReceiver,
