@@ -23,7 +23,9 @@ object Prefs {
     const val KEY_APPLIED_SCREEN_OFF  = "applied_screen_off"
     const val KEY_APPLIED_BLOCK_TOUCH = "applied_block_touch"
 
-    const val DEFAULT_DELAY           = 15
+    // Раньше задержка была нужна, чтобы успеть нажать кнопку каста руками.
+    // Модуль VR Display Mode включает дисплей сам, ждать больше нечего.
+    const val DEFAULT_DELAY           = 0
     const val DEFAULT_RESTORE_TIMEOUT = 15
 
     const val NAME = "vrapp"

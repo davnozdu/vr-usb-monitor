@@ -10,9 +10,11 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.SharedPreferences
+import android.hardware.display.DisplayManager
 import android.hardware.usb.UsbManager
 import android.os.IBinder
 import android.os.SystemClock
+import android.view.Display
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CoroutineScope
@@ -41,7 +43,7 @@ class UsbMonitorService : Service() {
         private const val TIMEOUT_NEVER = "2147483647"
 
         /** Display manager перебивает запись в sysfs — повторяем через паузу. */
-        private const val REAPPLY_DELAY_MS = 5_000L
+        private const val REAPPLY_DELAY_MS = 2_000L
 
         /** USB-события приходят чуть раньше, чем обновляется список устройств. */
         private const val SETTLE_DELAY_MS = 400L
@@ -72,6 +74,22 @@ class UsbMonitorService : Service() {
 
     private val prefs: SharedPreferences by lazy { Prefs.get(this) }
     private val usbManager: UsbManager by lazy { getSystemService(USB_SERVICE) as UsbManager }
+    private val displayManager: DisplayManager by lazy {
+        getSystemService(DISPLAY_SERVICE) as DisplayManager
+    }
+
+    /**
+     * Гасить экран имеет смысл только когда картинка реально ушла в очки.
+     * USB-подключение этого не гарантирует: гарнитура поднимает свои USB-
+     * устройства сразу, а DisplayPort может не подняться вовсе — тогда экран
+     * погас бы впустую, без изображения в очках. Появление внешнего дисплея
+     * — точный признак.
+     */
+    private val displayListener = object : DisplayManager.DisplayListener {
+        override fun onDisplayAdded(displayId: Int) = onDisplayEvent("дисплей подключён")
+        override fun onDisplayRemoved(displayId: Int) = onDisplayEvent("дисплей отключён")
+        override fun onDisplayChanged(displayId: Int) = Unit
+    }
 
     /** Метки последних вкл/выкл экрана — по ним ловим серию нажатий питания. */
     private val screenEvents = ArrayDeque<Long>()
@@ -121,6 +139,10 @@ class UsbMonitorService : Service() {
             ContextCompat.RECEIVER_NOT_EXPORTED,
         )
 
+        // null — события приходят на главный поток; вся работа всё равно
+        // уходит в корутину, так что блокировать его нечем.
+        displayManager.registerDisplayListener(displayListener, null)
+
         scope.launch {
             val hasRoot = RootUtils.checkRoot()
             VrState.setRootAvailable(hasRoot)
@@ -143,6 +165,7 @@ class UsbMonitorService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         try { unregisterReceiver(screenReceiver) } catch (_: Exception) {}
+        try { displayManager.unregisterDisplayListener(displayListener) } catch (_: Exception) {}
         blockJob?.cancel()
 
         // Единственное место, где ждём железо синхронно: после возврата из
@@ -197,13 +220,39 @@ class UsbMonitorService : Service() {
     private fun usbDevicesPresent(): Boolean =
         try { usbManager.deviceList.isNotEmpty() } catch (_: Exception) { false }
 
+    /** Есть ли включённый внешний дисплей — то есть видит ли пользователь картинку в очках. */
+    private fun externalDisplayPresent(): Boolean = try {
+        displayManager.displays.any { it.displayId != Display.DEFAULT_DISPLAY && it.isValid }
+    } catch (_: Exception) {
+        false
+    }
+
+    private fun onDisplayEvent(reason: String) {
+        scope.launch {
+            delay(SETTLE_DELAY_MS)
+            val present = externalDisplayPresent()
+            if (present && !isConnected) {
+                log(reason)
+                handleAttach()
+            } else if (!present && isConnected) {
+                log(reason)
+                handleDetach()
+            }
+        }
+    }
+
+    /**
+     * USB-событие само по себе решения не принимает: оно лишь будит сервис,
+     * а блокировка включается по внешнему дисплею. Отключение USB при этом
+     * снимает блокировку сразу — ждать пропажи дисплея незачем.
+     */
     private fun onUsbEvent() {
         scope.launch {
             delay(SETTLE_DELAY_MS)
-            val present = usbDevicesPresent()
-            when {
-                present && !isConnected -> handleAttach()
-                !present && isConnected -> handleDetach()
+            if (!usbDevicesPresent() && isConnected) {
+                handleDetach()
+            } else if (externalDisplayPresent() && !isConnected) {
+                handleAttach()
             }
         }
     }
@@ -372,7 +421,7 @@ class UsbMonitorService : Service() {
             return
         }
 
-        if (usbDevicesPresent()) {
+        if (externalDisplayPresent()) {
             // Гарнитура на месте — не зажигаем экран человеку посреди просмотра,
             // а просто подхватываем состояние обратно.
             isConnected = true
@@ -384,7 +433,7 @@ class UsbMonitorService : Service() {
             updateNotification("VR — экран отключён", true)
             log("Сервис перезапущен — состояние блокировки восстановлено")
         } else {
-            log("Сервис перезапущен, USB отсутствует — снимаю блокировку")
+            log("Сервис перезапущен, внешнего дисплея нет — снимаю блокировку")
             hwMutex.withLock { restore("перезапуск сервиса") }
             VrState.setPhase(VrState.Phase.IDLE)
         }
