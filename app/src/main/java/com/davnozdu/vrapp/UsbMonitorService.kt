@@ -1,93 +1,167 @@
 package com.davnozdu.vrapp
 
-import android.app.*
-import android.content.*
-import android.os.*
-import android.os.PowerManager
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.SharedPreferences
+import android.hardware.usb.UsbManager
+import android.os.IBinder
+import android.os.SystemClock
 import androidx.core.app.NotificationCompat
-import androidx.localbroadcastmanager.content.LocalBroadcastManager
+import androidx.core.content.ContextCompat
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import java.io.File
 
 class UsbMonitorService : Service() {
 
     companion object {
-        const val ACTION_USB_CONNECTED      = "com.davnozdu.vrapp.USB_CONNECTED"
-        const val ACTION_USB_DISCONNECTED   = "com.davnozdu.vrapp.USB_DISCONNECTED"
-        const val ACTION_COUNTDOWN          = "com.davnozdu.vrapp.COUNTDOWN"
-        const val ACTION_LOG                = "com.davnozdu.vrapp.LOG"
-        const val ACTION_EMERGENCY_RESTORED = "com.davnozdu.vrapp.EMERGENCY_RESTORED"
-        const val EXTRA_USB_ACTION          = "usb_action"
-        const val EXTRA_SECONDS_LEFT        = "seconds_left"
-        const val EXTRA_SERVICE_ACTION      = "service_action"
-        const val SERVICE_ACTION_EMERGENCY  = "emergency_reset"
+        const val EXTRA_USB_ACTION         = "usb_action"
+        const val EXTRA_SERVICE_ACTION     = "service_action"
+        const val SERVICE_ACTION_EMERGENCY = "emergency_reset"
 
         private const val CHANNEL_ID      = "vrapp_channel"
         private const val NOTIFICATION_ID = 1
 
-        // "Never sleep" value used by Macrodroid
-        private const val TIMEOUT_NEVER   = "2147483647"
+        /** Максимальный int — экран не гасится сам, пока гарнитура подключена. */
+        private const val TIMEOUT_NEVER = "2147483647"
+
+        /** Display manager перебивает запись в sysfs — повторяем через паузу. */
+        private const val REAPPLY_DELAY_MS = 5_000L
+
+        /** USB-события приходят чуть раньше, чем обновляется список устройств. */
+        private const val SETTLE_DELAY_MS = 400L
+
+        /** Аварийный выход: столько событий вкл/выкл экрана за окно = паника. */
+        private const val PANIC_EVENTS    = 4
+        private const val PANIC_WINDOW_MS = 3_000L
+
+        private const val WATCHDOG_SCRIPT = "vr_watchdog.sh"
+
+        /** Наличие этого файла означает штатную остановку: сторож выходит молча. */
+        private const val WATCHDOG_STOP_FILE = "vr_watchdog_stop"
     }
 
-    // Discovered hardware paths (may be empty if root wasn't ready at startup)
-    private var touchInhibitPath: String = ""
-    private var backlightPath: String    = ""
+    private val job   = SupervisorJob()
+    private val scope = CoroutineScope(Dispatchers.IO + job)
 
-    // State
+    /** Сериализует любые записи в железо, чтобы блокировка и откат не пересекались. */
+    private val hwMutex = Mutex()
+
+    private var touchInhibitPath = ""
+    private var backlightPath    = ""
+
     @Volatile private var isConnected = false
     @Volatile private var isBlocked   = false
 
-    // Saved values to restore on disconnect
-    private var savedBacklight        = -1
-    private var savedSystemBrightness = -1
-    private var savedBrightnessMode   = -1
+    private var blockJob: Job? = null
 
-    private val handler = Handler(Looper.getMainLooper())
-    private var pendingBlock: Runnable? = null
-    private var countdownTimer: CountDownTimer? = null
-    private var wakeLock: PowerManager.WakeLock? = null
+    private val prefs: SharedPreferences by lazy { Prefs.get(this) }
+    private val usbManager: UsbManager by lazy { getSystemService(USB_SERVICE) as UsbManager }
 
-    // Re-darkens screen if it comes on while VR is active (mirrors Macrodroid "VR On 2")
-    private val screenOnReceiver = object : BroadcastReceiver() {
+    /** Метки последних вкл/выкл экрана — по ним ловим серию нажатий питания. */
+    private val screenEvents = ArrayDeque<Long>()
+
+    private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             if (!isBlocked) return
-            handler.postDelayed({
-                Thread { reapplyBacklight() }.start()
-            }, 10_000L)
-            log("Экран включился — повторное затемнение через 10с")
+
+            val now = SystemClock.elapsedRealtime()
+            synchronized(screenEvents) {
+                screenEvents.addLast(now)
+                while (screenEvents.isNotEmpty() && now - screenEvents.first() > PANIC_WINDOW_MS) {
+                    screenEvents.removeFirst()
+                }
+                if (screenEvents.size >= PANIC_EVENTS) {
+                    screenEvents.clear()
+                    log("Серия нажатий питания — аварийный сброс")
+                    scope.launch { emergencyRestore() }
+                    return
+                }
+            }
+
+            if (intent.action == Intent.ACTION_SCREEN_ON) {
+                log("Экран включился — повторное затемнение через 10 с")
+                scope.launch {
+                    delay(10_000L)
+                    if (isBlocked) hwMutex.withLock { reapplyBacklight() }
+                }
+            }
         }
     }
 
-    // ── Lifecycle ────────────────────────────────────────────────────────────
+    // ── Жизненный цикл ───────────────────────────────────────────────────────
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification("Мониторинг активен", false))
-        registerReceiver(screenOnReceiver, IntentFilter(Intent.ACTION_SCREEN_ON))
-        Thread { discoverHardware() }.start()
+
+        ContextCompat.registerReceiver(
+            this,
+            screenReceiver,
+            IntentFilter().apply {
+                addAction(Intent.ACTION_SCREEN_ON)
+                addAction(Intent.ACTION_SCREEN_OFF)
+            },
+            ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
+
+        scope.launch {
+            val hasRoot = RootUtils.checkRoot()
+            VrState.setRootAvailable(hasRoot)
+            discoverHardware()
+            recoverAfterRestart()
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.getStringExtra(EXTRA_USB_ACTION)) {
-            "android.hardware.usb.action.USB_DEVICE_ATTACHED" -> onUsbAttached()
-            "android.hardware.usb.action.USB_DEVICE_DETACHED" -> onUsbDetached()
+            UsbManager.ACTION_USB_DEVICE_ATTACHED,
+            UsbManager.ACTION_USB_DEVICE_DETACHED -> onUsbEvent()
         }
         if (intent?.getStringExtra(EXTRA_SERVICE_ACTION) == SERVICE_ACTION_EMERGENCY) {
-            Thread { emergencyRestore() }.start()
+            scope.launch { emergencyRestore() }
         }
         return START_STICKY
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        unregisterReceiver(screenOnReceiver)
-        cancelPending()
-        if (isConnected || isBlocked) onUsbDetached()
-        releaseWakeLock()
+        try { unregisterReceiver(screenReceiver) } catch (_: Exception) {}
+        blockJob?.cancel()
+
+        // Единственное место, где ждём железо синхронно: после возврата из
+        // onDestroy процесс может быть убит, и откатывать станет некому.
+        // restore() не suspend, поэтому таймаут ставим на настоящем потоке —
+        // withTimeoutOrNull здесь нечего было бы прерывать. Если не уложимся,
+        // блокировку всё равно снимет root-сторож.
+        if (isBlocked) {
+            val t = Thread { restore("сервис остановлен") }
+            t.start()
+            t.join(5_000L)
+        }
+        scope.cancel()
+        RootShell.close()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    // ── Hardware discovery ───────────────────────────────────────────────────
+    // ── Поиск узлов ──────────────────────────────────────────────────────────
 
     private fun discoverHardware() {
         touchInhibitPath = RootUtils.findTouchInhibit()
@@ -101,7 +175,6 @@ class UsbMonitorService : Service() {
         }
     }
 
-    // Retry discovery at block time in case root wasn't ready at startup
     private fun ensurePathsDiscovered() {
         if (touchInhibitPath.isEmpty()) {
             touchInhibitPath = RootUtils.findTouchInhibit()
@@ -113,189 +186,292 @@ class UsbMonitorService : Service() {
         }
     }
 
-    // ── USB events ───────────────────────────────────────────────────────────
+    // ── USB ──────────────────────────────────────────────────────────────────
 
-    private fun onUsbAttached() {
-        if (isConnected) return
-        isConnected = true
-        broadcast(ACTION_USB_CONNECTED)
+    /**
+     * Решение принимается по фактическому составу шины, а не по факту события.
+     * Гарнитура — композитное устройство (HID + audio + hub), она поднимает
+     * несколько ATTACHED и роняет несколько DETACHED; по одному лишь событию
+     * блокировка снималась бы, пока очки ещё на голове.
+     */
+    private fun usbDevicesPresent(): Boolean =
+        try { usbManager.deviceList.isNotEmpty() } catch (_: Exception) { false }
 
-        val delaySec = Prefs.get(this).getInt(Prefs.KEY_DELAY_SECONDS, Prefs.DEFAULT_DELAY)
-        if (delaySec == 0) {
-            log("USB подключено — блокирую немедленно")
-            Thread { applyBlocking() }.start()
-            return
+    private fun onUsbEvent() {
+        scope.launch {
+            delay(SETTLE_DELAY_MS)
+            val present = usbDevicesPresent()
+            when {
+                present && !isConnected -> handleAttach()
+                !present && isConnected -> handleDetach()
+            }
         }
-        log("USB подключено — блокировка через ${formatTime(delaySec)}")
-        startCountdown(delaySec)
-        pendingBlock = Runnable { Thread { applyBlocking() }.start() }
-        handler.postDelayed(pendingBlock!!, delaySec * 1000L)
     }
 
-    private fun onUsbDetached() {
-        cancelPending()
+    private fun handleAttach() {
+        isConnected = true
+        VrState.setPhase(VrState.Phase.WAITING)
+
+        val delaySec = prefs.getInt(Prefs.KEY_DELAY_SECONDS, Prefs.DEFAULT_DELAY)
+            .coerceIn(0, 120)
+
+        blockJob?.cancel()
+        blockJob = scope.launch {
+            if (delaySec == 0) {
+                log("USB подключено — блокирую немедленно")
+            } else {
+                log("USB подключено — блокировка через ${formatTime(delaySec)}")
+                for (left in delaySec downTo 1) {
+                    VrState.setPhase(VrState.Phase.WAITING, left)
+                    delay(1_000L)
+                }
+            }
+
+            hwMutex.withLock { applyBlocking() }
+
+            // Пауза вне мьютекса: отключение USB в этот момент должно уметь
+            // немедленно откатить всё, не дожидаясь повторной записи.
+            delay(REAPPLY_DELAY_MS)
+            if (isActive && isBlocked && isConnected) {
+                hwMutex.withLock { reapplyBacklight() }
+                log("Подсветка выключена")
+            }
+        }
+    }
+
+    private suspend fun handleDetach() {
+        blockJob?.cancel()
+        blockJob = null
         isConnected = false
         log("USB отключено")
-        if (isBlocked) {
-            restoreAll()
-            isBlocked = false
-        }
-        releaseWakeLock()
+        if (isBlocked) hwMutex.withLock { restore("USB отключено") }
+        VrState.setPhase(VrState.Phase.IDLE)
         updateNotification("Мониторинг активен", false)
-        broadcast(ACTION_USB_DISCONNECTED)
     }
 
-    // ── Blocking ─────────────────────────────────────────────────────────────
+    // ── Блокировка ───────────────────────────────────────────────────────────
 
     private fun applyBlocking() {
-        // Retry path discovery in case root wasn't ready when service started
         ensurePathsDiscovered()
 
-        val prefs      = Prefs.get(this)
         val screenOff  = prefs.getBoolean(Prefs.KEY_SCREEN_OFF,  true)
         val blockTouch = prefs.getBoolean(Prefs.KEY_BLOCK_TOUCH, true)
 
-        // Prevent system auto-sleep
-        RootUtils.execute("settings put system screen_off_timeout $TIMEOUT_NEVER")
+        val savedBacklight =
+            if (screenOff && backlightPath.isNotEmpty()) RootUtils.readBacklightValue(backlightPath)
+            else -1
+
+        // Снимок пишется ДО первой записи в железо. Если процесс умрёт прямо
+        // сейчас, поднявшийся заново сервис (или root-сторож) будет знать,
+        // что откатывать и к каким значениям.
+        saveAppliedSnapshot(screenOff, blockTouch, savedBacklight)
+        isBlocked = true
+        startWatchdog(savedBacklight)
+
+        RootShell.exec("settings put system screen_off_timeout $TIMEOUT_NEVER")
         log("Таймаут экрана → ∞")
 
         if (screenOff) {
-            savedBrightnessMode = RootUtils.executeForOutput(
-                "settings get system screen_brightness_mode"
-            ).toIntOrNull() ?: 1
-
+            RootShell.exec("settings put system screen_brightness_mode 0")
+            RootShell.exec("settings put system screen_brightness 0")
             if (backlightPath.isNotEmpty()) {
-                savedBacklight = RootUtils.readBacklightValue(backlightPath)
-                savedSystemBrightness = RootUtils.executeForOutput(
-                    "settings get system screen_brightness"
-                ).toIntOrNull() ?: 128
-                // Step 1: zero via Android settings layer (disables auto-brightness)
-                RootUtils.execute("settings put system screen_brightness_mode 0")
-                RootUtils.execute("settings put system screen_brightness 0")
-                RootUtils.execute("echo 0 > $backlightPath")
-                log("Подсветка → 0, повтор через 5с...")
-                // Step 2: repeat after 5 s — overrides any display-manager restore
-                Thread.sleep(5_000L)
-                if (isConnected) {
-                    RootUtils.execute("echo 0 > $backlightPath")
-                    log("Подсветка выключена")
-                }
+                RootShell.exec("echo 0 > \"$backlightPath\"")
+                log("Подсветка → 0, повтор через 5 с...")
             } else {
-                savedBacklight = RootUtils.executeForOutput(
-                    "settings get system screen_brightness"
-                ).toIntOrNull() ?: 128
-                RootUtils.execute("settings put system screen_brightness_mode 0")
-                RootUtils.execute("settings put system screen_brightness 0")
-                log("Подсветка выключена (fallback via settings)")
+                log("Подсветка выключена (только через settings — sysfs не найден)")
             }
         }
 
         if (blockTouch) {
             if (touchInhibitPath.isNotEmpty()) {
-                RootUtils.execute("echo 1 > $touchInhibitPath")
+                RootShell.exec("echo 1 > \"$touchInhibitPath\"")
                 log("Тач заблокирован ($touchInhibitPath)")
             } else {
-                log("Тач: путь не найден — нет root или не найден /sys/class/input")
+                log("Тач: узел inhibited не найден — нет root или устройство не поддерживает")
             }
         }
 
-        isBlocked = true
-        acquireWakeLock()
+        VrState.setPhase(VrState.Phase.BLOCKED)
         updateNotification("VR — экран отключён", true)
-        log("Аварийный сброс: кнопка в уведомлении или отключите USB")
+        log("Выход: отключите USB, 4 нажатия питания или кнопка в уведомлении")
     }
 
     private fun reapplyBacklight() {
         if (!isBlocked) return
-        RootUtils.execute("settings put system screen_brightness_mode 0")
-        RootUtils.execute("settings put system screen_brightness 0")
-        if (backlightPath.isNotEmpty()) {
-            RootUtils.execute("echo 0 > $backlightPath")
-        }
+        RootShell.exec("settings put system screen_brightness_mode 0")
+        RootShell.exec("settings put system screen_brightness 0")
+        if (backlightPath.isNotEmpty()) RootShell.exec("echo 0 > \"$backlightPath\"")
     }
 
-    private fun restoreAll() {
-        val prefs      = Prefs.get(this)
-        val screenOff  = prefs.getBoolean(Prefs.KEY_SCREEN_OFF,  true)
-        val blockTouch = prefs.getBoolean(Prefs.KEY_BLOCK_TOUCH, true)
+    // ── Восстановление ───────────────────────────────────────────────────────
 
-        // Set configured restore timeout (mirrors Macrodroid "VR Off")
+    /**
+     * Откат идёт строго по снимку [saveAppliedSnapshot], а не по текущим
+     * настройкам: иначе выключенный на ходу тумблер "блокировать тачскрин"
+     * оставил бы тач навсегда заинхибиченным.
+     */
+    private fun restore(reason: String) {
+        if (!prefs.getBoolean(Prefs.KEY_APPLIED, false)) {
+            isBlocked = false
+            return
+        }
+
+        val touchPath      = prefs.getString(Prefs.KEY_APPLIED_TOUCH_PATH, "").orEmpty()
+        val blPath         = prefs.getString(Prefs.KEY_APPLIED_BL_PATH, "").orEmpty()
+        val blValue        = prefs.getInt(Prefs.KEY_APPLIED_BL_VALUE, -1)
+        val didScreenOff   = prefs.getBoolean(Prefs.KEY_APPLIED_SCREEN_OFF, false)
+        val didBlockTouch  = prefs.getBoolean(Prefs.KEY_APPLIED_BLOCK_TOUCH, false)
+
         val restoreSec = prefs.getInt(Prefs.KEY_RESTORE_TIMEOUT, Prefs.DEFAULT_RESTORE_TIMEOUT)
-        RootUtils.execute("settings put system screen_off_timeout ${restoreSec * 1000}")
-        log("Таймаут экрана → ${formatTime(restoreSec)}")
+            .coerceIn(15, 60)
+        RootShell.exec("settings put system screen_off_timeout ${restoreSec * 1000}")
 
-        if (screenOff && savedBacklight >= 0) {
-            if (backlightPath.isNotEmpty()) {
-                RootUtils.execute("echo $savedBacklight > $backlightPath")
+        if (didScreenOff) {
+            if (blPath.isNotEmpty() && blValue >= 0) {
+                RootShell.exec("echo $blValue > \"$blPath\"")
             }
-            if (savedSystemBrightness >= 0) {
-                RootUtils.execute("settings put system screen_brightness $savedSystemBrightness")
-                savedSystemBrightness = -1
-            }
-            // Always restore to Auto brightness mode
-            RootUtils.execute("settings put system screen_brightness_mode 1")
-            savedBrightnessMode = -1
-            savedBacklight = -1
+            // Абсолютное значение screen_brightness намеренно не возвращаем:
+            // шкала зависит от устройства (на OnePlus 15 это 0..4095, а не 0..255),
+            // и авто-режим всё равно выставит корректную яркость сам.
+            RootShell.exec("settings put system screen_brightness_mode 1")
             log("Подсветка восстановлена (авто)")
         }
 
-        if (blockTouch && touchInhibitPath.isNotEmpty()) {
-            RootUtils.execute("echo 0 > $touchInhibitPath")
+        if (didBlockTouch && touchPath.isNotEmpty()) {
+            RootShell.exec("echo 0 > \"$touchPath\"")
             log("Тач восстановлен")
+        }
+
+        clearAppliedSnapshot()
+        stopWatchdog()
+        isBlocked = false
+        log("Восстановлено: $reason")
+    }
+
+    private suspend fun emergencyRestore() {
+        if (!isBlocked) return
+        hwMutex.withLock { restore("аварийный сброс") }
+        VrState.setPhase(VrState.Phase.UNBLOCKED)
+        updateNotification("Разблокировано вручную (USB подключён)", false)
+    }
+
+    /**
+     * Сервис мог быть убит системой в заблокированном состоянии: START_STICKY
+     * поднимет его заново с пустым состоянием, а железо останется погашенным.
+     */
+    private suspend fun recoverAfterRestart() {
+        if (!prefs.getBoolean(Prefs.KEY_APPLIED, false)) return
+
+        // Снимок мог пережить откат, сделанный root-сторожем: он снимает
+        // блокировку, но до prefs приложения не дотягивается. Верить снимку
+        // можно только если железо и правда всё ещё заблокировано.
+        if (!hardwareStillBlocked()) {
+            log("Снимок блокировки устарел — железо уже разблокировано")
+            clearAppliedSnapshot()
+            VrState.setPhase(VrState.Phase.IDLE)
+            return
+        }
+
+        if (usbDevicesPresent()) {
+            // Гарнитура на месте — не зажигаем экран человеку посреди просмотра,
+            // а просто подхватываем состояние обратно.
+            isConnected = true
+            isBlocked   = true
+            touchInhibitPath = prefs.getString(Prefs.KEY_APPLIED_TOUCH_PATH, "").orEmpty()
+            backlightPath    = prefs.getString(Prefs.KEY_APPLIED_BL_PATH, "").orEmpty()
+            startWatchdog(prefs.getInt(Prefs.KEY_APPLIED_BL_VALUE, -1))
+            VrState.setPhase(VrState.Phase.BLOCKED)
+            updateNotification("VR — экран отключён", true)
+            log("Сервис перезапущен — состояние блокировки восстановлено")
+        } else {
+            log("Сервис перезапущен, USB отсутствует — снимаю блокировку")
+            hwMutex.withLock { restore("перезапуск сервиса") }
+            VrState.setPhase(VrState.Phase.IDLE)
         }
     }
 
-    // ── Emergency restore ─────────────────────────────────────────────────────
+    /** Читает sysfs и говорит, действительно ли блокировка из снимка ещё в силе. */
+    private fun hardwareStillBlocked(): Boolean {
+        val touchPath = prefs.getString(Prefs.KEY_APPLIED_TOUCH_PATH, "").orEmpty()
+        val blPath    = prefs.getString(Prefs.KEY_APPLIED_BL_PATH, "").orEmpty()
 
-    private fun emergencyRestore() {
-        if (!isBlocked) return
-        log("Аварийный сброс")
-        restoreAll()
-        isBlocked = false
-        releaseWakeLock()
-        updateNotification("Разблокировано вручную (USB подключён)", false)
-        broadcast(ACTION_EMERGENCY_RESTORED)
+        if (prefs.getBoolean(Prefs.KEY_APPLIED_BLOCK_TOUCH, false) && touchPath.isNotEmpty()) {
+            return RootShell.out("cat \"$touchPath\"") == "1"
+        }
+        if (prefs.getBoolean(Prefs.KEY_APPLIED_SCREEN_OFF, false) && blPath.isNotEmpty()) {
+            return RootShell.out("cat \"$blPath\"") == "0"
+        }
+        // Нечего проверить (нет root или обе опции выключены) — считаем снимок валидным.
+        return true
     }
 
-    // ── Countdown ────────────────────────────────────────────────────────────
+    // ── Снимок применённого состояния ────────────────────────────────────────
 
-    private fun startCountdown(totalSeconds: Int) {
-        countdownTimer?.cancel()
-        countdownTimer = object : CountDownTimer(totalSeconds * 1000L, 1000L) {
-            override fun onTick(millis: Long) { broadcastCountdown(((millis + 999) / 1000).toInt()) }
-            override fun onFinish() { broadcastCountdown(0) }
-        }.start()
+    private fun saveAppliedSnapshot(screenOff: Boolean, blockTouch: Boolean, backlight: Int) {
+        prefs.edit()
+            .putBoolean(Prefs.KEY_APPLIED, true)
+            .putString(Prefs.KEY_APPLIED_TOUCH_PATH, touchInhibitPath)
+            .putString(Prefs.KEY_APPLIED_BL_PATH, backlightPath)
+            .putInt(Prefs.KEY_APPLIED_BL_VALUE, backlight)
+            .putBoolean(Prefs.KEY_APPLIED_SCREEN_OFF, screenOff)
+            .putBoolean(Prefs.KEY_APPLIED_BLOCK_TOUCH, blockTouch)
+            .commit()   // commit, а не apply: процесс может не дожить до сброса на диск
     }
 
-    private fun cancelPending() {
-        countdownTimer?.cancel(); countdownTimer = null
-        pendingBlock?.let { handler.removeCallbacks(it) }; pendingBlock = null
+    private fun clearAppliedSnapshot() {
+        prefs.edit().putBoolean(Prefs.KEY_APPLIED, false).commit()
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
+    // ── Root-сторож ("мёртвая рука") ─────────────────────────────────────────
+
+    private fun stopFile() = File(filesDir, WATCHDOG_STOP_FILE)
+
+    /**
+     * Сторож живёт в root-шелле и следит за /proc/<pid> приложения. Если процесс
+     * исчезнет (OOM-киллер, краш), он сам вернёт яркость и снимет блокировку —
+     * иначе телефон остался бы с чёрным экраном и мёртвым тачем без выхода.
+     *
+     * Слежение идёт именно за процессом, а не за файлом-пульсом от приложения:
+     * пульс останавливался, как только устройство уходило в Doze (там система
+     * перестаёт уважать PARTIAL_WAKE_LOCK), и сторож снимал блокировку с живым
+     * приложением. Наличие /proc/<pid> от таймеров приложения не зависит вовсе.
+     */
+    private fun startWatchdog(savedBacklight: Int) {
+        val script = File(filesDir, WATCHDOG_SCRIPT)
+        script.writeText(WATCHDOG_SH)
+        stopFile().delete()
+
+        val restoreSec = prefs.getInt(Prefs.KEY_RESTORE_TIMEOUT, Prefs.DEFAULT_RESTORE_TIMEOUT)
+            .coerceIn(15, 60)
+
+        val args = listOf(
+            android.os.Process.myPid().toString(),
+            stopFile().absolutePath,
+            touchInhibitPath,
+            backlightPath,
+            savedBacklight.toString(),
+            (restoreSec * 1000).toString(),
+        ).joinToString(" ") { "\"$it\"" }
+
+        RootShell.exec("nohup sh \"${script.absolutePath}\" $args >/dev/null 2>&1 &")
+    }
+
+    /** Штатная остановка: сторож увидит файл и выйдет, ничего не восстанавливая. */
+    private fun stopWatchdog() {
+        try { stopFile().writeText("stop") } catch (_: Exception) {}
+    }
+
+    // ── Прочее ───────────────────────────────────────────────────────────────
 
     private fun formatTime(s: Int) = "%d:%02d".format(s / 60, s % 60)
 
-    private fun log(msg: String) = handler.post {
-        LocalBroadcastManager.getInstance(this)
-            .sendBroadcast(Intent(ACTION_LOG).putExtra("message", msg))
-    }
-
-    private fun broadcast(action: String) = handler.post {
-        LocalBroadcastManager.getInstance(this).sendBroadcast(Intent(action))
-    }
-
-    private fun broadcastCountdown(left: Int) = handler.post {
-        LocalBroadcastManager.getInstance(this)
-            .sendBroadcast(Intent(ACTION_COUNTDOWN).putExtra(EXTRA_SECONDS_LEFT, left))
-    }
+    private fun log(msg: String) = VrState.log(msg)
 
     private fun createNotificationChannel() {
-        // IMPORTANCE_MIN — канал не показывает иконку в статус-баре,
-        // уведомление видно только при раскрытии шторки. Foreground-сервис
-        // защищён, процесс живёт дольше.
+        // IMPORTANCE_MIN: иконки в статус-баре нет, уведомление видно только
+        // в развёрнутой шторке — там же лежит кнопка аварийного сброса.
         val channel = NotificationChannel(
-            CHANNEL_ID, "VR Monitor", NotificationManager.IMPORTANCE_MIN
+            CHANNEL_ID, "VR Monitor", NotificationManager.IMPORTANCE_MIN,
         ).apply {
             setShowBadge(false)
             setSound(null, null)
@@ -307,43 +483,68 @@ class UsbMonitorService : Service() {
 
     private fun buildNotification(text: String, showReset: Boolean): Notification {
         val open = PendingIntent.getActivity(
-            this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
+            this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE,
         )
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("VR Monitor").setContentText(text)
-            .setSmallIcon(android.R.drawable.ic_menu_manage).setContentIntent(open)
+            .setContentTitle("VR Monitor")
+            .setContentText(text)
+            .setSmallIcon(android.R.drawable.ic_menu_manage)
+            .setContentIntent(open)
             .setPriority(NotificationCompat.PRIORITY_MIN)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .setSilent(true)
             .setShowWhen(false)
+            .setOngoing(true)
         if (showReset) {
             val reset = PendingIntent.getService(
                 this, 1,
                 Intent(this, UsbMonitorService::class.java)
                     .putExtra(EXTRA_SERVICE_ACTION, SERVICE_ACTION_EMERGENCY),
-                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
             )
-            builder.addAction(android.R.drawable.ic_menu_close_clear_cancel, "Аварийный сброс", reset)
+            builder.addAction(
+                android.R.drawable.ic_menu_close_clear_cancel, "Аварийный сброс", reset,
+            )
         }
         return builder.build()
     }
 
-    private fun acquireWakeLock() {
-        if (wakeLock?.isHeld == true) return
-        val pm = getSystemService(POWER_SERVICE) as PowerManager
-        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "vrapp:block").apply {
-            setReferenceCounted(false)
-            acquire()
+    private fun updateNotification(text: String, showReset: Boolean) {
+        try {
+            getSystemService(NotificationManager::class.java)
+                .notify(NOTIFICATION_ID, buildNotification(text, showReset))
+        } catch (_: Exception) {
+            // POST_NOTIFICATIONS могли не выдать — сервис при этом работает дальше
         }
     }
 
-    private fun releaseWakeLock() {
-        wakeLock?.takeIf { it.isHeld }?.release()
-        wakeLock = null
-    }
-
-    private fun updateNotification(text: String, showReset: Boolean) = handler.post {
-        getSystemService(NotificationManager::class.java)
-            .notify(NOTIFICATION_ID, buildNotification(text, showReset))
-    }
 }
+
+/**
+ * Сторож живёт в root-шелле и переживает смерть приложения.
+ * Аргументы: pid приложения, файл штатной остановки, узел inhibited,
+ * узел brightness, сохранённая яркость, таймаут экрана в мс.
+ */
+private val WATCHDOG_SH = """
+#!/system/bin/sh
+PID="${'$'}1"; STOP="${'$'}2"; TOUCH="${'$'}3"; BL="${'$'}4"; BLVAL="${'$'}5"; TIMEOUT="${'$'}6"
+
+while [ -d "/proc/${'$'}PID" ]; do
+  # Приложение сняло блокировку само — уходим, ничего не трогая.
+  [ -f "${'$'}STOP" ] && exit 0
+  # Тот ли это процесс: pid мог быть переиспользован после смерти приложения.
+  grep -q vrapp "/proc/${'$'}PID/cmdline" 2>/dev/null || break
+  sleep 2
+done
+
+# Ещё одна проверка на случай гонки: приложение успело завершиться штатно.
+[ -f "${'$'}STOP" ] && exit 0
+
+# Процесс приложения исчез — снимаем блокировку сами.
+[ -n "${'$'}TOUCH" ] && echo 0 > "${'$'}TOUCH" 2>/dev/null
+if [ -n "${'$'}BL" ] && [ "${'$'}BLVAL" -ge 0 ] 2>/dev/null; then
+  echo "${'$'}BLVAL" > "${'$'}BL" 2>/dev/null
+fi
+settings put system screen_brightness_mode 1
+settings put system screen_off_timeout "${'$'}TIMEOUT"
+""".trimIndent()

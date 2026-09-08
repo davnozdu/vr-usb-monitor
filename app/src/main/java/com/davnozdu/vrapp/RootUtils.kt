@@ -1,75 +1,39 @@
 package com.davnozdu.vrapp
 
+/**
+ * Поиск и чтение sysfs-узлов, которыми управляется экран и тачскрин.
+ * Вся работа идёт через единственный [RootShell].
+ */
 object RootUtils {
 
-    // KernelSU and Magisk put su in different locations
-    private val SU_CANDIDATES = listOf("/system/bin/su", "/sbin/su", "su")
+    fun checkRoot(): Boolean = RootShell.isAvailable()
 
-    @Volatile private var suPath: String = ""
-
-    private fun resolveSu(): String {
-        if (suPath.isNotEmpty()) return suPath
-        for (candidate in SU_CANDIDATES) {
-            try {
-                val p = Runtime.getRuntime().exec(arrayOf(candidate, "-c", "echo ok"))
-                val ok = p.inputStream.bufferedReader().readLine()?.trim() == "ok"
-                p.waitFor()
-                if (ok) { suPath = candidate; return candidate }
-            } catch (_: Exception) {}
-        }
-        return ""
-    }
-
-    fun checkRoot(): Boolean = resolveSu().isNotEmpty()
-
-    fun getSuPath(): String = resolveSu()
-
-    fun execute(command: String): Boolean {
-        val su = resolveSu().ifEmpty { return false }
-        return try {
-            val p = Runtime.getRuntime().exec(arrayOf(su, "-c", command))
-            p.waitFor() == 0
-        } catch (_: Exception) { false }
-    }
-
-    fun executeForOutput(command: String): String {
-        val su = resolveSu().ifEmpty { return "" }
-        return try {
-            val p = Runtime.getRuntime().exec(arrayOf(su, "-c", command))
-            val out = p.inputStream.bufferedReader().readText().trim()
-            p.waitFor()
-            out
-        } catch (_: Exception) { "" }
-    }
-
-    // Touchscreen via Linux input subsystem inhibit interface.
-    // Uses grep to find the name file containing "touch" pattern,
-    // then constructs the inhibited path — avoids multi-line su -c issues.
+    /**
+     * Тачскрин через inhibit-интерфейс input-подсистемы ядра.
+     * Ищем в /sys/class/input/<N>/name устройство с "touch" в имени и проверяем,
+     * что рядом лежит узел inhibited (на OnePlus 15 это input7 / "touchpanel").
+     */
     fun findTouchInhibit(): String {
         for (pattern in listOf("touchpanel", "touchscreen", "touch_panel", "touch")) {
-            val namePath = executeForOutput(
+            val namePath = RootShell.out(
                 "grep -rl '$pattern' /sys/class/input/*/name 2>/dev/null | head -1"
-            ).trim()
-            if (namePath.startsWith("/sys/")) {
-                val inhibitedPath = namePath.removeSuffix("name") + "inhibited"
-                val exists = executeForOutput("test -f $inhibitedPath && echo ok").trim()
-                if (exists == "ok") return inhibitedPath
-            }
+            )
+            if (!namePath.startsWith("/sys/")) continue
+            val inhibited = namePath.removeSuffix("name") + "inhibited"
+            if (RootShell.ok("test -f \"$inhibited\"")) return inhibited
         }
         return ""
     }
 
-    // Backlight sysfs brightness node.
-    // On OnePlus 15: /sys/class/backlight/panel0-backlight/brightness
+    /** Узел яркости подсветки. На OnePlus 15: /sys/class/backlight/panel0-backlight/brightness */
     fun findBacklightPath(): String =
-        executeForOutput("ls /sys/class/backlight/*/brightness 2>/dev/null | head -1")
+        RootShell.out("ls /sys/class/backlight/*/brightness 2>/dev/null | head -1")
+            .lineSequence().firstOrNull { it.startsWith("/sys/") } ?: ""
 
     fun readBacklightValue(path: String): Int =
-        executeForOutput("cat $path").toIntOrNull() ?: -1
+        RootShell.out("cat \"$path\"").toIntOrNull() ?: -1
 
-    fun readBacklightMax(path: String): Int {
-        val maxPath = path.replace("brightness", "max_brightness")
-        return executeForOutput("cat $maxPath").toIntOrNull() ?: 255
-    }
-
+    /** Текущее значение system-настройки как Int, или [fallback] если прочитать не вышло. */
+    fun getSystemInt(key: String, fallback: Int): Int =
+        RootShell.out("settings get system $key").toIntOrNull() ?: fallback
 }

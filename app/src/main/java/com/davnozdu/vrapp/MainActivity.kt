@@ -1,55 +1,199 @@
 package com.davnozdu.vrapp
 
-import android.content.*
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
 import android.view.LayoutInflater
 import android.widget.CheckBox
+import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
-import androidx.localbroadcastmanager.content.LocalBroadcastManager
+import androidx.core.graphics.Insets
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.updatePadding
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
 import com.davnozdu.vrapp.databinding.ActivityMainBinding
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
-import java.util.*
+import java.util.Date
+import java.util.Locale
 
 class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
-    private val logLines = ArrayDeque<String>(50)
+    private val logLines = ArrayDeque<String>()
     private val timeFmt = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
 
-    private val eventReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context, intent: Intent) {
-            when (intent.action) {
-                UsbMonitorService.ACTION_USB_CONNECTED    -> setStatus(State.WAITING)
-                UsbMonitorService.ACTION_USB_DISCONNECTED -> setStatus(State.IDLE)
-                UsbMonitorService.ACTION_EMERGENCY_RESTORED -> setStatus(State.UNBLOCKED)
-                UsbMonitorService.ACTION_COUNTDOWN -> {
-                    val left = intent.getIntExtra(UsbMonitorService.EXTRA_SECONDS_LEFT, 0)
-                    if (left == 0) setStatus(State.BLOCKED) else setStatus(State.WAITING, left)
-                }
-                UsbMonitorService.ACTION_LOG -> appendLog(intent.getStringExtra("message") ?: "")
-            }
+    private val requestNotifications =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (!granted) warnNotificationsBlocked()
         }
-    }
-
-    private enum class State { IDLE, WAITING, BLOCKED, UNBLOCKED }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        applyWindowInsets()
 
         setupToggles()
         setupDelaySlider()
         setupRestoreSlider()
-        checkRoot()
-        setStatus(State.IDLE)
+        observeState()
+
+        ensureNotificationPermission()
         maybeShowInputTip()
         maybeRequestBatteryOptimization()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Root мог быть выдан уже после первого запуска — результат проверки
+        // кэшируется, поэтому при каждом возврате в приложение спрашиваем заново.
+        lifecycleScope.launch(Dispatchers.IO) {
+            RootShell.forgetAvailability()
+            VrState.setRootAvailable(RootUtils.checkRoot())
+        }
+    }
+
+    /** targetSdk 35+ рисует контент под системными панелями — возвращаем отступы руками. */
+    private fun applyWindowInsets() {
+        val base = Insets.of(
+            binding.root.paddingLeft, binding.root.paddingTop,
+            binding.root.paddingRight, binding.root.paddingBottom,
+        )
+        ViewCompat.setOnApplyWindowInsetsListener(binding.root) { view, windowInsets ->
+            val bars = windowInsets.getInsets(
+                WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout(),
+            )
+            view.updatePadding(
+                left   = base.left + bars.left,
+                top    = base.top + bars.top,
+                right  = base.right + bars.right,
+                bottom = base.bottom + bars.bottom,
+            )
+            windowInsets
+        }
+    }
+
+    // ── Состояние ────────────────────────────────────────────────────────────
+
+    private fun observeState() {
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                launch {
+                    VrState.status.collect { render(it) }
+                }
+                launch {
+                    VrState.rootAvailable.collect { available ->
+                        if (available == null) return@collect
+                        binding.rootStatusText.text =
+                            if (available) "Root: доступен"
+                            else "Root: недоступен — выдайте в KernelSU → SuperUser"
+                        binding.rootStatusText.setTextColor(
+                            getColor(if (available) R.color.green else R.color.red),
+                        )
+                    }
+                }
+                launch {
+                    VrState.log.collect { appendLog(it) }
+                }
+            }
+        }
+    }
+
+    private fun render(status: VrState.Status) {
+        when (status.phase) {
+            VrState.Phase.IDLE -> {
+                binding.statusDot.setBackgroundResource(R.drawable.circle_disconnected)
+                binding.statusText.text    = "USB устройство не подключено"
+                binding.statusSubtext.text = "Ожидание подключения..."
+            }
+            VrState.Phase.WAITING -> {
+                binding.statusDot.setBackgroundResource(R.drawable.circle_waiting)
+                binding.statusText.text    = "USB подключено"
+                binding.statusSubtext.text =
+                    if (status.secondsLeft > 0) "Блокировка через ${formatDelay(status.secondsLeft)}..."
+                    else "Подготовка..."
+            }
+            VrState.Phase.BLOCKED -> {
+                binding.statusDot.setBackgroundResource(R.drawable.circle_connected)
+                binding.statusText.text    = "Активно — экран отключён"
+                binding.statusSubtext.text = "USB, 4 нажатия питания или уведомление"
+            }
+            VrState.Phase.UNBLOCKED -> {
+                binding.statusDot.setBackgroundResource(R.drawable.circle_waiting)
+                binding.statusText.text    = "Разблокировано вручную"
+                binding.statusSubtext.text = "USB всё ещё подключён"
+            }
+        }
+    }
+
+    private fun appendLog(message: String) {
+        logLines.addFirst("[${timeFmt.format(Date())}] $message")
+        while (logLines.size > 50) logLines.removeLast()
+        binding.logText.text = logLines.joinToString("\n")
+        binding.logScrollView.post { binding.logScrollView.scrollTo(0, 0) }
+    }
+
+    // ── Разрешения ───────────────────────────────────────────────────────────
+
+    /**
+     * Без POST_NOTIFICATIONS уведомление foreground-сервиса не публикуется —
+     * а вместе с ним пропадает кнопка аварийного сброса, единственный выход
+     * при погашенной подсветке кроме отключения USB.
+     */
+    private fun ensureNotificationPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        val granted = ContextCompat.checkSelfPermission(
+            this, Manifest.permission.POST_NOTIFICATIONS,
+        ) == PackageManager.PERMISSION_GRANTED
+        if (granted) return
+
+        if (shouldShowRequestPermissionRationale(Manifest.permission.POST_NOTIFICATIONS)) {
+            AlertDialog.Builder(this)
+                .setTitle("Нужны уведомления")
+                .setMessage(
+                    "В уведомлении живёт кнопка аварийного сброса. Без неё, " +
+                        "когда подсветка погашена, снять блокировку можно только " +
+                        "отключением USB или четырьмя нажатиями кнопки питания.",
+                )
+                .setPositiveButton("Разрешить") { _, _ ->
+                    requestNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
+                }
+                .setNegativeButton("Позже", null)
+                .show()
+        } else {
+            requestNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
+    private fun warnNotificationsBlocked() {
+        AlertDialog.Builder(this)
+            .setTitle("Уведомления отключены")
+            .setMessage(
+                "Кнопка аварийного сброса будет недоступна. Останутся: отключить USB " +
+                    "или нажать кнопку питания 4 раза подряд.",
+            )
+            .setPositiveButton("Открыть настройки") { _, _ ->
+                startActivity(
+                    Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                        .putExtra(Settings.EXTRA_APP_PACKAGE, packageName),
+                )
+            }
+            .setNegativeButton("Понятно", null)
+            .show()
     }
 
     private fun maybeShowInputTip() {
@@ -88,27 +232,15 @@ class MainActivity : AppCompatActivity() {
                 .setData(Uri.parse("package:$packageName"))
             startActivity(intent)
         } catch (_: Exception) {
-            startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+            try {
+                startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+            } catch (_: Exception) {
+            }
         }
         prefs.edit().putBoolean(Prefs.KEY_BATTERY_OPT_ASKED, true).apply()
     }
 
-    override fun onResume() {
-        super.onResume()
-        val filter = IntentFilter().apply {
-            addAction(UsbMonitorService.ACTION_USB_CONNECTED)
-            addAction(UsbMonitorService.ACTION_USB_DISCONNECTED)
-            addAction(UsbMonitorService.ACTION_COUNTDOWN)
-            addAction(UsbMonitorService.ACTION_EMERGENCY_RESTORED)
-            addAction(UsbMonitorService.ACTION_LOG)
-        }
-        LocalBroadcastManager.getInstance(this).registerReceiver(eventReceiver, filter)
-    }
-
-    override fun onPause() {
-        super.onPause()
-        LocalBroadcastManager.getInstance(this).unregisterReceiver(eventReceiver)
-    }
+    // ── Настройки ────────────────────────────────────────────────────────────
 
     private fun setupToggles() {
         val prefs = Prefs.get(this)
@@ -131,14 +263,14 @@ class MainActivity : AppCompatActivity() {
             prefs.edit().putBoolean(Prefs.KEY_BLOCK_TOUCH, v).apply()
         }
 
-        setActionTogglesEnabled(prefs.getBoolean(Prefs.KEY_ENABLED, true))
-        if (prefs.getBoolean(Prefs.KEY_ENABLED, true)) startMonitoring()
+        val enabled = prefs.getBoolean(Prefs.KEY_ENABLED, true)
+        setActionTogglesEnabled(enabled)
+        if (enabled) startMonitoring()
     }
 
     private fun setupDelaySlider() {
         val prefs = Prefs.get(this)
         val saved = prefs.getInt(Prefs.KEY_DELAY_SECONDS, Prefs.DEFAULT_DELAY)
-        // Clamp to new valid range [0, 120] in case old saved value > 120
         val clamped = saved.coerceIn(0, 120).let { it - (it % 5) }
         binding.delaySlider.value = clamped.toFloat()
         binding.delayValueText.text = formatDelay(clamped)
@@ -152,7 +284,6 @@ class MainActivity : AppCompatActivity() {
     private fun setupRestoreSlider() {
         val prefs = Prefs.get(this)
         val saved = prefs.getInt(Prefs.KEY_RESTORE_TIMEOUT, Prefs.DEFAULT_RESTORE_TIMEOUT)
-        // Valid values: 15, 30, 45, 60
         val clamped = (saved.coerceIn(15, 60) / 15) * 15
         binding.restoreTimeoutSlider.value = clamped.toFloat()
         binding.restoreTimeoutValueText.text = formatDelay(clamped)
@@ -164,68 +295,26 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setActionTogglesEnabled(enabled: Boolean) {
-        binding.switchScreenOff.isEnabled        = enabled
-        binding.switchBlockTouch.isEnabled       = enabled
-        binding.delaySlider.isEnabled            = enabled
-        binding.restoreTimeoutSlider.isEnabled   = enabled
-    }
-
-    private fun checkRoot() {
-        Thread {
-            val hasRoot = RootUtils.checkRoot()
-            runOnUiThread {
-                binding.rootStatusText.text = if (hasRoot) "Root: доступен"
-                    else "Root: недоступен — выдайте в KernelSU → SuperUser"
-                binding.rootStatusText.setTextColor(
-                    getColor(if (hasRoot) R.color.green else R.color.red)
-                )
-            }
-        }.start()
-    }
-
-    private fun setStatus(state: State, secondsLeft: Int = 0) {
-        when (state) {
-            State.IDLE -> {
-                binding.statusDot.setBackgroundResource(R.drawable.circle_disconnected)
-                binding.statusText.text    = "USB устройство не подключено"
-                binding.statusSubtext.text = "Ожидание подключения..."
-            }
-            State.WAITING -> {
-                binding.statusDot.setBackgroundResource(R.drawable.circle_waiting)
-                binding.statusText.text    = "USB подключено"
-                binding.statusSubtext.text =
-                    if (secondsLeft > 0) "Блокировка через ${formatDelay(secondsLeft)}..."
-                    else "Подготовка..."
-            }
-            State.BLOCKED -> {
-                binding.statusDot.setBackgroundResource(R.drawable.circle_connected)
-                binding.statusText.text    = "Активно — экран отключён"
-                binding.statusSubtext.text = "Уведомление → Аварийный сброс"
-            }
-            State.UNBLOCKED -> {
-                binding.statusDot.setBackgroundResource(R.drawable.circle_waiting)
-                binding.statusText.text    = "Разблокировано вручную"
-                binding.statusSubtext.text = "USB всё ещё подключён"
-            }
-        }
-    }
-
-    private fun appendLog(message: String) {
-        val line = "[${timeFmt.format(Date())}] $message"
-        if (logLines.size >= 50) logLines.removeLast()
-        logLines.addFirst(line)
-        binding.logText.text = logLines.joinToString("\n")
-        binding.logScrollView.post { binding.logScrollView.scrollTo(0, 0) }
+        binding.switchScreenOff.isEnabled      = enabled
+        binding.switchBlockTouch.isEnabled     = enabled
+        binding.delaySlider.isEnabled          = enabled
+        binding.restoreTimeoutSlider.isEnabled = enabled
     }
 
     private fun startMonitoring() {
-        ContextCompat.startForegroundService(this, Intent(this, UsbMonitorService::class.java))
+        ContextCompat.startForegroundService(
+            this, Intent(this, UsbMonitorService::class.java),
+        )
     }
 
     private fun formatDelay(seconds: Int): String {
         if (seconds == 0) return "Сразу"
         val m = seconds / 60
         val s = seconds % 60
-        return if (m == 0) "${s}с" else if (s == 0) "${m} мин" else "${m}:${"%02d".format(s)}"
+        return when {
+            m == 0 -> "${s}с"
+            s == 0 -> "$m мин"
+            else   -> "$m:${"%02d".format(s)}"
+        }
     }
 }
