@@ -254,7 +254,24 @@ class UsbMonitorService : Service() {
     private suspend fun evaluate(reason: String) {
         val present = externalDisplayPresent()
         when {
-            present && !isConnected -> { log(reason); handleAttach() }
+            present && !isConnected -> {
+                // Дисплей говорит «что-то воткнули», фильтр — «это те самые очки».
+                // Монитор или телевизор по тому же USB-C выглядят для дисплейной
+                // подсистемы одинаково, а гасить телефон нужно только под очками.
+                if (UsbDevices.shouldReact(this)) {
+                    log(reason)
+                    val matched = UsbDevices.matched(this)
+                    if (matched.isNotEmpty()) {
+                        log("Опознаны: " + matched.joinToString(", ") { d -> d.toString() })
+                    }
+                    handleAttach()
+                } else {
+                    // Не молча: иначе бездействие выглядит как поломка.
+                    log("Внешний дисплей подключён, но это не выбранные очки — пропускаю")
+                }
+            }
+            // Отключение проверяется только по дисплею. Фильтр здесь не нужен:
+            // если экран уже погашен, снять блокировку важнее любых условий.
             !present && isConnected -> { log(reason); handleDetach() }
         }
     }
