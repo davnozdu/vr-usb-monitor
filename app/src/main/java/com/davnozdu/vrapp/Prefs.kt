@@ -13,6 +13,11 @@ object Prefs {
     const val KEY_HIDE_INPUT_TIP      = "hide_input_tip"
     const val KEY_BATTERY_OPT_ASKED   = "battery_opt_asked"
 
+    // Фильтр по конкретным очкам. Выключен по умолчанию: обновление не должно
+    // менять поведение у тех, кто про фильтр не знает.
+    const val KEY_FILTER_ENABLED      = "filter_enabled"
+    const val KEY_DEVICES             = "devices"        // Set<String>, "vid:pid:имя"
+
     // Снимок того, что реально применено к железу. Нужен, чтобы откатить
     // именно применённое (а не текущие настройки), и чтобы пережить смерть
     // процесса: сервис, поднятый заново, должен знать, что экран погашен им.

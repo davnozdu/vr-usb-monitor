@@ -48,6 +48,7 @@ class MainActivity : AppCompatActivity() {
         applyWindowInsets()
 
         setupToggles()
+        setupDeviceFilter()
         setupDelaySlider()
         setupRestoreSlider()
         observeState()
@@ -253,6 +254,7 @@ class MainActivity : AppCompatActivity() {
         binding.switchEnabled.isChecked = prefs.getBoolean(Prefs.KEY_ENABLED, true)
         binding.switchEnabled.setOnCheckedChangeListener { _, checked ->
             prefs.edit().putBoolean(Prefs.KEY_ENABLED, checked).commit()
+            UsbDevices.exportForModule(this)
             setActionTogglesEnabled(checked)
             if (checked) {
                 startMonitoring()
@@ -311,6 +313,78 @@ class MainActivity : AppCompatActivity() {
         binding.switchBlockTouch.isEnabled     = enabled
         binding.delaySlider.isEnabled          = enabled
         binding.restoreTimeoutSlider.isEnabled = enabled
+        binding.switchDeviceFilter.isEnabled   = enabled
+        binding.selectDevicesButton.isEnabled  = enabled
+    }
+
+    // ── Фильтр по очкам ──────────────────────────────────────────────────────
+
+    private fun setupDeviceFilter() {
+        val prefs = Prefs.get(this)
+
+        binding.switchDeviceFilter.isChecked = prefs.getBoolean(Prefs.KEY_FILTER_ENABLED, false)
+        binding.switchDeviceFilter.setOnCheckedChangeListener { _, checked ->
+            prefs.edit().putBoolean(Prefs.KEY_FILTER_ENABLED, checked).commit()
+            UsbDevices.exportForModule(this)
+            renderDeviceList()
+        }
+
+        binding.selectDevicesButton.setOnClickListener { showDevicePicker() }
+        renderDeviceList()
+    }
+
+    private fun renderDeviceList() {
+        val saved = UsbDevices.saved(this)
+        val filterOn = binding.switchDeviceFilter.isChecked
+        binding.deviceListText.text = when {
+            saved.isEmpty() && filterOn ->
+                "Очки не выбраны — реагирую на любой внешний дисплей"
+            saved.isEmpty() ->
+                "Фильтр выключен — реагирую на любой внешний дисплей"
+            else ->
+                saved.joinToString("\n") { "• $it" }
+        }
+    }
+
+    /**
+     * Выбор из того, что воткнуто прямо сейчас. Вводить VID:PID руками не нужно,
+     * а уже сохранённые очки показываются отмеченными, даже если сейчас отключены —
+     * иначе снять галочку с лежащей в столе гарнитуры было бы нечем.
+     */
+    private fun showDevicePicker() {
+        val saved = UsbDevices.saved(this)
+        val savedIds = saved.map { it.idString }.toSet()
+        val connected = UsbDevices.connected(this)
+
+        val items = (saved + connected.filter { it.idString !in savedIds })
+            .distinctBy { it.idString }
+
+        if (items.isEmpty()) {
+            AlertDialog.Builder(this)
+                .setTitle("Очки не найдены")
+                .setMessage("Подключите очки по USB и откройте список снова.")
+                .setPositiveButton("Понятно", null)
+                .show()
+            return
+        }
+
+        val connectedIds = connected.map { it.idString }.toSet()
+        val labels = items.map { d ->
+            if (d.idString in connectedIds) "$d — подключены" else "$d"
+        }.toTypedArray()
+        val checked = items.map { it.idString in savedIds }.toBooleanArray()
+
+        AlertDialog.Builder(this)
+            .setTitle("Какие очки считать своими")
+            .setMultiChoiceItems(labels, checked) { _, which, isChecked ->
+                checked[which] = isChecked
+            }
+            .setPositiveButton("Сохранить") { _, _ ->
+                UsbDevices.save(this, items.filterIndexed { i, _ -> checked[i] })
+                renderDeviceList()
+            }
+            .setNegativeButton("Отмена", null)
+            .show()
     }
 
     private fun startMonitoring() {
