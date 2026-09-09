@@ -135,7 +135,12 @@ class MainActivity : AppCompatActivity() {
             VrState.Phase.UNBLOCKED -> {
                 binding.statusDot.setBackgroundResource(R.drawable.circle_waiting)
                 binding.statusText.text    = "Разблокировано вручную"
-                binding.statusSubtext.text = "USB всё ещё подключён"
+                binding.statusSubtext.text = "Очки всё ещё подключены"
+            }
+            VrState.Phase.OFF -> {
+                binding.statusDot.setBackgroundResource(R.drawable.circle_disconnected)
+                binding.statusText.text    = "Перехват выключен"
+                binding.statusSubtext.text = "Очки работают как обычный монитор"
             }
         }
     }
@@ -247,10 +252,17 @@ class MainActivity : AppCompatActivity() {
 
         binding.switchEnabled.isChecked = prefs.getBoolean(Prefs.KEY_ENABLED, true)
         binding.switchEnabled.setOnCheckedChangeListener { _, checked ->
-            prefs.edit().putBoolean(Prefs.KEY_ENABLED, checked).apply()
+            prefs.edit().putBoolean(Prefs.KEY_ENABLED, checked).commit()
             setActionTogglesEnabled(checked)
-            if (checked) startMonitoring()
-            else stopService(Intent(this, UsbMonitorService::class.java))
+            if (checked) {
+                startMonitoring()
+            } else {
+                // Сервис на остановке снимает блокировку, если она была,
+                // и больше не поднимется: ресиверы, модуль и START_STICKY
+                // сверяются с этим же флагом.
+                stopService(Intent(this, UsbMonitorService::class.java))
+                VrState.setPhase(VrState.Phase.OFF)
+            }
         }
 
         binding.switchScreenOff.isChecked  = prefs.getBoolean(Prefs.KEY_SCREEN_OFF,  true)
@@ -265,7 +277,7 @@ class MainActivity : AppCompatActivity() {
 
         val enabled = prefs.getBoolean(Prefs.KEY_ENABLED, true)
         setActionTogglesEnabled(enabled)
-        if (enabled) startMonitoring()
+        if (enabled) startMonitoring() else VrState.setPhase(VrState.Phase.OFF)
     }
 
     private fun setupDelaySlider() {

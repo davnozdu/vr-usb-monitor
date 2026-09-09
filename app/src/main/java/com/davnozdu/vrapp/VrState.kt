@@ -14,7 +14,7 @@ import kotlinx.coroutines.flow.asStateFlow
  */
 object VrState {
 
-    enum class Phase { IDLE, WAITING, BLOCKED, UNBLOCKED }
+    enum class Phase { IDLE, WAITING, BLOCKED, UNBLOCKED, OFF }
 
     data class Status(
         val phase: Phase = Phase.IDLE,
