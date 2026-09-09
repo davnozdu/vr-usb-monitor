@@ -128,6 +128,11 @@ class UsbMonitorService : Service() {
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification("Мониторинг активен", false))
 
+        // Файл для модуля обновляем до проверки флага: модулю важно узнать
+        // именно про выключенное приложение, иначе он будет считать состояние
+        // по старому файлу или не найдёт его вовсе после переустановки.
+        UsbDevices.exportForModule(this)
+
         // Сервис могут поднять снаружи — ресивером, модулем или системой после
         // START_STICKY. Выключенный пользователем мониторинг должен оставаться
         // выключенным независимо от того, кто именно нас запустил.
@@ -301,8 +306,9 @@ class UsbMonitorService : Service() {
             // немедленно откатить всё, не дожидаясь повторной записи.
             delay(REAPPLY_DELAY_MS)
             if (isActive && isBlocked && isConnected) {
-                hwMutex.withLock { reapplyBacklight() }
-                log("Подсветка выключена")
+                // Сообщаем только о том, что действительно сделали: раньше
+                // строка писалась и тогда, когда подсветку гасить не просили.
+                if (hwMutex.withLock { reapplyBacklight() }) log("Подсветка выключена")
             }
         }
     }
@@ -363,11 +369,21 @@ class UsbMonitorService : Service() {
         log("Выход: отключите очки, 4 нажатия питания или кнопка в уведомлении")
     }
 
-    private fun reapplyBacklight() {
-        if (!isBlocked) return
+    /**
+     * Повтор гашения: display manager перебивает первую запись в sysfs.
+     *
+     * Идёт по снимку применённого, а не по текущим настройкам — как и откат.
+     * Раньше проверки не было вовсе, и подсветка гасла даже с выключенным
+     * тумблером "Выключать подсветку": первичное применение его уважало,
+     * а повтор через две секунды — нет.
+     */
+    private fun reapplyBacklight(): Boolean {
+        if (!isBlocked) return false
+        if (!prefs.getBoolean(Prefs.KEY_APPLIED_SCREEN_OFF, true)) return false
         RootShell.exec("settings put system screen_brightness_mode 0")
         RootShell.exec("settings put system screen_brightness 0")
         if (backlightPath.isNotEmpty()) RootShell.exec("echo 0 > \"$backlightPath\"")
+        return true
     }
 
     // ── Восстановление ───────────────────────────────────────────────────────
