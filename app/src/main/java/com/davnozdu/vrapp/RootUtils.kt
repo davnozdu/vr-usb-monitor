@@ -33,6 +33,20 @@ object RootUtils {
     fun readBacklightValue(path: String): Int =
         RootShell.out("cat \"$path\"").toIntOrNull() ?: -1
 
+    /**
+     * Режим очков из общего файла модулей VR Headset Mode и VR Display Mode.
+     *
+     * В режиме гарнитуры очки нужны только как звук и микрофоны. Внешний
+     * дисплей при этом всё равно включается — без успешного DisplayPort-линка
+     * очки не поднимают аудиоусилитель, — но гасить из-за него экран телефона
+     * нельзя: картинки в очках нет, и телефон гас бы впустую.
+     *
+     * Файла нет, значение другое или root не выдан — считаем, что режимом
+     * никто не управляет, и ведём себя как раньше.
+     */
+    fun headsetMode(): Boolean =
+        RootShell.out("cat /data/adb/vr_mode 2>/dev/null").trim() == "headset"
+
     /** Текущее значение system-настройки как Int, или [fallback] если прочитать не вышло. */
     fun getSystemInt(key: String, fallback: Int): Int =
         RootShell.out("settings get system $key").toIntOrNull() ?: fallback
